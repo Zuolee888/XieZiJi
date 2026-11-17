@@ -123,6 +123,20 @@ pub enum DeviceCommand {
         swap_xy: bool,
         flip_y: bool,
     },
+    /// Lists nearby Bluetooth devices. Discovery is read-only, so it stays
+    /// available while a link is live.
+    BtScan,
+    /// Enables the device's SPP service, resolves the COM port Windows just
+    /// created for that MAC, and connects through the normal serial path.
+    BtConnect {
+        mac: String,
+        swap_xy: bool,
+        flip_y: bool,
+    },
+    /// Removes the system pairing and refreshes the device list.
+    BtForget {
+        mac: String,
+    },
     Disconnect,
     Jog {
         x: f64,
@@ -172,6 +186,15 @@ pub enum DeviceCommand {
 #[derive(Clone, Debug)]
 pub enum DeviceEvent {
     Ports(Vec<PortInfo>),
+    /// Bluetooth discovery result, separate from the serial port list because
+    /// an unpaired device has no COM port yet.
+    BtDevices(Vec<crate::bluetooth::BtDevice>),
+    /// Pairing succeeded but no SPP port carries the requested MAC yet. `mac`
+    /// is echoed so the UI can retry the same device without a rescan.
+    BtPortNotReady {
+        mac: String,
+        reason: String,
+    },
     Connected(String),
     Disconnected,
     Status(Status),
@@ -305,7 +328,8 @@ impl DeviceService {
                 | DeviceCommand::Pause
                 | DeviceCommand::Resume
                 | DeviceCommand::Connect { .. }
-                | DeviceCommand::AutoConnect { .. } => return,
+                | DeviceCommand::AutoConnect { .. }
+                | DeviceCommand::BtConnect { .. } => return,
                 DeviceCommand::BeginRegistration { .. }
                 | DeviceCommand::CancelRegistration
                 | DeviceCommand::FinishRegistration { .. }
@@ -1226,6 +1250,44 @@ fn worker(
 ) {
     worker_loop(commands, events, None, recovery, None, None);
 }
+/// Discovery duration. Long enough for a sleeping plotter to answer an inquiry
+/// but still short enough that the panel does not look hung.
+const BT_SCAN_SECONDS: u8 = 8;
+fn scan_bluetooth(emit: &impl Fn(DeviceEvent)) {
+    match crate::bluetooth::backend().scan(BT_SCAN_SECONDS) {
+        Ok(devices) => emit(DeviceEvent::BtDevices(devices)),
+        Err(e) => emit(DeviceEvent::Error(e)),
+    }
+}
+/// Why a MAC could not be turned into an openable COM port.
+///
+/// `NotReady` means pairing was attempted but Windows has not published the
+/// SPP port yet, which is a retryable state the UI must report differently
+/// from a hard failure.
+enum BtPortError {
+    NotReady(String),
+    Failed(String),
+}
+/// Enables the device's SPP service and resolves the COM port bound to `mac`.
+///
+/// `ensure_spp` returning Ok only means Windows accepted the request; the port
+/// appears asynchronously and several rows can exist for one MAC, so the port
+/// is always chosen by MAC and never by number.
+fn bluetooth_port_for(mac: &str) -> Result<String, BtPortError> {
+    let address = crate::bluetooth::Mac::parse(mac).ok_or_else(|| {
+        BtPortError::NotReady("MAC 地址无法解析，请重新扫描设备列表".into())
+    })?;
+    let backend = crate::bluetooth::backend();
+    backend.ensure_spp(address).map_err(BtPortError::Failed)?;
+    let ports = backend.spp_ports().map_err(BtPortError::Failed)?;
+    crate::bluetooth::choose_port_for_mac(&ports, address)
+        .map(|port| port.port_name.clone())
+        .ok_or_else(|| {
+            BtPortError::NotReady(
+                "系统还没有为该设备建立串口，请确认写字机已开机且未被手机占用".into(),
+            )
+        })
+}
 fn accept_ack(pending: &mut Option<Instant>) -> Result<(), String> {
     pending
         .take()
@@ -1358,7 +1420,7 @@ fn worker_loop(
                     Ok(p) => emit(DeviceEvent::Ports(p)),
                     Err(e) => emit(DeviceEvent::Error(e)),
                 },
-                DeviceCommand::Connect { .. } | DeviceCommand::AutoConnect { .. } if link.is_some() => emit(
+                DeviceCommand::Connect { .. } | DeviceCommand::AutoConnect { .. } | DeviceCommand::BtConnect { .. } if link.is_some() => emit(
                     DeviceEvent::Error("Disconnect before connecting again".into()),
                 ),
                 DeviceCommand::Connect { port: name, swap_xy: requested, flip_y: invert_y } => {
@@ -1410,6 +1472,45 @@ fn worker_loop(
                         Err(e) => emit(DeviceEvent::Error(e)),
                     },
                     Err(e) => emit(DeviceEvent::Error(e)),
+                    }
+                }
+                DeviceCommand::BtScan => scan_bluetooth(&emit),
+                DeviceCommand::BtForget { mac } => {
+                    match crate::bluetooth::Mac::parse(&mac) {
+                        Some(mac) => match crate::bluetooth::backend().forget(mac) {
+                            Ok(()) => scan_bluetooth(&emit),
+                            Err(e) => emit(DeviceEvent::Error(e)),
+                        },
+                        None => emit(DeviceEvent::Error(
+                            "MAC 地址无法解析，请重新扫描设备列表".into(),
+                        )),
+                    }
+                }
+                DeviceCommand::BtConnect { mac, swap_xy: requested, flip_y: invert_y } => {
+                    swap_xy = requested;
+                    set_flip_y(invert_y);
+                    match bluetooth_port_for(&mac) {
+                        Err(BtPortError::NotReady(reason)) => {
+                            emit(DeviceEvent::BtPortNotReady { mac, reason })
+                        }
+                        Err(BtPortError::Failed(message)) => emit(DeviceEvent::Error(message)),
+                        Ok(name) => match connect(&name, swap_xy) {
+                            Ok((l, s)) => {
+                                link = Some(l);
+                                connected_port = Some(name.clone());
+                                last_received = Instant::now();
+                                held_after_stop = s.state != "Idle";
+                                status = s.clone();
+                                calibration = None;
+                                registration_pending = false; registration_second = None;
+                                explicit_origin = false;
+                                emit(DeviceEvent::AutoOrigin(true));
+                                emit(DeviceEvent::CalibrationChanged { origin: None });
+                                emit(DeviceEvent::Connected(name));
+                                emit(DeviceEvent::Status(s));
+                            }
+                            Err(e) => emit(DeviceEvent::Error(e)),
+                        },
                     }
                 }
                 DeviceCommand::Disconnect => {

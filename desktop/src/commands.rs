@@ -85,6 +85,15 @@ pub enum Request {
         #[serde(default)] swap_xy: bool,
         #[serde(default)] flip_y: bool,
     },
+    BtScan,
+    BtConnect {
+        mac: String,
+        #[serde(default)] swap_xy: bool,
+        #[serde(default)] flip_y: bool,
+    },
+    BtForget {
+        mac: String,
+    },
     Disconnect,
     Jog {
         x: f64,
@@ -136,6 +145,9 @@ pub fn device_command(command: Request, state: tauri::State<Backend>) -> Result<
         Request::AutoConnect { swap_xy, flip_y } => DeviceCommand::AutoConnect { swap_xy, flip_y },
         Request::Connect { port, swap_xy, flip_y } => DeviceCommand::Connect { port, swap_xy, flip_y },
         Request::Recover { port, swap_xy, flip_y } => DeviceCommand::Recover { port, swap_xy, flip_y },
+        Request::BtScan => DeviceCommand::BtScan,
+        Request::BtConnect { mac, swap_xy, flip_y } => DeviceCommand::BtConnect { mac, swap_xy, flip_y },
+        Request::BtForget { mac } => DeviceCommand::BtForget { mac },
         Request::Disconnect => DeviceCommand::Disconnect,
         Request::Jog { x, y, feed } => DeviceCommand::Jog { x, y, feed },
         Request::Calibrate {
@@ -198,39 +210,46 @@ pub fn poll_device(state: tauri::State<Backend>) -> Result<Vec<Value>, String> {
         .map_err(|e| e.to_string())?
         .poll()
         .into_iter()
-        .map(|e| match e {
-            DeviceEvent::Ports(ports) => json!({"type":"ports","ports":ports}),
-            DeviceEvent::AutoOrigin(automatic) => {
-                json!({"type":"origin_mode","automatic":automatic})
-            }
-            DeviceEvent::Connected(port) => json!({"type":"connected","port":port}),
-            DeviceEvent::Disconnected => json!({"type":"disconnected"}),
-            DeviceEvent::Status(status) => json!({"type":"status","status":status}),
-            DeviceEvent::Log(message) => json!({"type":"log","message":message}),
-            DeviceEvent::Error(message) => json!({"type":"error","message":message}),
-            DeviceEvent::JobRejected { reason, running } => {
-                json!({"type":"job_rejected","reason":reason,"running":running})
-            }
-            DeviceEvent::Progress { sent, total } => {
-                json!({"type":"progress","sent":sent,"total":total})
-            }
-            DeviceEvent::Timing { total_seconds, cumulative_seconds } => {
-                json!({"type":"timing","total_seconds":total_seconds,"cumulative_seconds":cumulative_seconds})
-            }
-            DeviceEvent::StrokeCompleted { index } => json!({"type":"stroke_completed","index":index}),
-            DeviceEvent::Completed => json!({"type":"completed"}),
-            DeviceEvent::Stopped => json!({"type":"stopped"}),
-            DeviceEvent::Recovering(active) => json!({"type":"recovering","active":active}),
-            DeviceEvent::Positioning(active) => json!({"type":"positioning","active":active}),
-            DeviceEvent::RegistrationChanged { scale, rotation_deg, matrix } => json!({"type":"registration_changed", "scale":scale, "rotation_deg":rotation_deg, "matrix":matrix}),
-            DeviceEvent::RegistrationPointCaptured { index } => json!({"type":"registration_point_captured", "index":index}),
-            DeviceEvent::CalibrationChanged { origin } => {
-                json!({"type":"calibration_changed","origin":origin})
-            }
-            DeviceEvent::JobStarted { anchor } => json!({"type":"job_started","anchor":anchor}),
-            DeviceEvent::Paused(paused) => json!({"type":"paused","paused":paused}),
-        })
+        .map(map_event)
         .collect())
+}
+fn map_event(e: DeviceEvent) -> Value {
+    match e {
+        DeviceEvent::Ports(ports) => json!({"type":"ports","ports":ports}),
+        DeviceEvent::BtDevices(devices) => json!({"type":"bt_devices","devices":devices}),
+        DeviceEvent::BtPortNotReady { reason, .. } => {
+            json!({"type":"bt_error","message":reason})
+        }
+        DeviceEvent::AutoOrigin(automatic) => {
+            json!({"type":"origin_mode","automatic":automatic})
+        }
+        DeviceEvent::Connected(port) => json!({"type":"connected","port":port}),
+        DeviceEvent::Disconnected => json!({"type":"disconnected"}),
+        DeviceEvent::Status(status) => json!({"type":"status","status":status}),
+        DeviceEvent::Log(message) => json!({"type":"log","message":message}),
+        DeviceEvent::Error(message) => json!({"type":"error","message":message}),
+        DeviceEvent::JobRejected { reason, running } => {
+            json!({"type":"job_rejected","reason":reason,"running":running})
+        }
+        DeviceEvent::Progress { sent, total } => {
+            json!({"type":"progress","sent":sent,"total":total})
+        }
+        DeviceEvent::Timing { total_seconds, cumulative_seconds } => {
+            json!({"type":"timing","total_seconds":total_seconds,"cumulative_seconds":cumulative_seconds})
+        }
+        DeviceEvent::StrokeCompleted { index } => json!({"type":"stroke_completed","index":index}),
+        DeviceEvent::Completed => json!({"type":"completed"}),
+        DeviceEvent::Stopped => json!({"type":"stopped"}),
+        DeviceEvent::Recovering(active) => json!({"type":"recovering","active":active}),
+        DeviceEvent::Positioning(active) => json!({"type":"positioning","active":active}),
+        DeviceEvent::RegistrationChanged { scale, rotation_deg, matrix } => json!({"type":"registration_changed", "scale":scale, "rotation_deg":rotation_deg, "matrix":matrix}),
+        DeviceEvent::RegistrationPointCaptured { index } => json!({"type":"registration_point_captured", "index":index}),
+        DeviceEvent::CalibrationChanged { origin } => {
+            json!({"type":"calibration_changed","origin":origin})
+        }
+        DeviceEvent::JobStarted { anchor } => json!({"type":"job_started","anchor":anchor}),
+        DeviceEvent::Paused(paused) => json!({"type":"paused","paused":paused}),
+    }
 }
 #[tauri::command]
 pub fn default_import_options() -> ImportOptions {
@@ -844,6 +863,41 @@ mod tests {
             assert!(serde_json::from_value::<Request>(json!({"type":kind,"port":"mock","swap_xy":true})).is_ok());
             assert!(serde_json::from_value::<Request>(json!({"type":kind,"port":"mock","swap_xy":"true"})).is_err());
         }
+    }
+    #[test]
+    fn bt_requests_round_trip_through_serde() {
+        let r: Request = serde_json::from_value(serde_json::json!({"type":"bt_scan"})).unwrap();
+        assert!(matches!(r, Request::BtScan));
+        let r: Request = serde_json::from_value(
+            serde_json::json!({"type":"bt_connect","mac":"70:4B:CA:72:AC:A2"}),
+        ).unwrap();
+        assert!(matches!(r, Request::BtConnect { ref mac, .. } if mac == "70:4B:CA:72:AC:A2"));
+        // The UI always sends the axis mapping; the webview defaults are not
+        // the device defaults, so both flags must survive the trip.
+        let r: Request = serde_json::from_value(serde_json::json!({
+            "type":"bt_connect","mac":"70:4B:CA:72:AC:A2","swap_xy":true,"flip_y":true
+        })).unwrap();
+        assert!(matches!(
+            r,
+            Request::BtConnect { swap_xy: true, flip_y: true, .. }
+        ));
+        let r: Request =
+            serde_json::from_value(serde_json::json!({"type":"bt_forget","mac":"70:4B:CA:72:AC:A2"}))
+                .unwrap();
+        assert!(matches!(r, Request::BtForget { ref mac } if mac == "70:4B:CA:72:AC:A2"));
+        assert!(serde_json::from_value::<Request>(serde_json::json!({"type":"bt_connect"}))
+            .is_err());
+    }
+    #[test]
+    fn bt_devices_event_becomes_poll_payload() {
+        let v = map_event(DeviceEvent::BtDevices(vec![crate::bluetooth::BtDevice {
+            mac: "70:4B:CA:72:AC:A2".into(),
+            name: "BtWriter".into(),
+            remembered: true,
+            authenticated: false,
+        }]));
+        assert_eq!(v["type"], "bt_devices");
+        assert_eq!(v["devices"][0]["name"], "BtWriter");
     }
     #[test]
     fn font_layout_jitter_preserves_paths_and_repeats_with_seed() {
