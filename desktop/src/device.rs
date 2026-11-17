@@ -39,6 +39,31 @@ pub struct PortInfo {
     #[serde(default)]
     pub mac: Option<String>,
 }
+
+/// A port that is the only preferred candidate of its link kind. Two or more
+/// candidates of the same kind are ambiguous, so they are not offered.
+fn single_preferred(ports: &[PortInfo], kind: PortKind) -> Option<&PortInfo> {
+    let mut candidates = ports.iter().filter(|p| p.preferred && p.kind == kind);
+    let first = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// Resolve the port automatic connection may use: a lone preferred USB (CH340)
+/// bridge wins, otherwise a lone preferred Bluetooth SPP plotter. Anything else
+/// - including stale Bluetooth ports that are not usable plotters - is refused
+/// instead of guessed.
+pub fn auto_select_candidate(ports: &[PortInfo]) -> Result<&PortInfo, String> {
+    if let Some(usb) = single_preferred(ports, PortKind::Usb) {
+        return Ok(usb);
+    }
+    if let Some(bluetooth) = single_preferred(ports, PortKind::Bluetooth) {
+        return Ok(bluetooth);
+    }
+    Err("请手动选择串口：自动识别要求恰好一台 CH340 或一台已绑定的蓝牙写字机".into())
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Status {
     pub state: String,
@@ -1224,12 +1249,9 @@ fn worker_loop(
                 DeviceCommand::AutoConnect { swap_xy: requested } => {
                     swap_xy = requested;
                     match DeviceService::ports() {
-                    Ok(p) => {
-                        let candidates: Vec<_> = p.into_iter().filter(|p| p.preferred).collect();
-                        if candidates.len() != 1 {
-                            emit(DeviceEvent::Error("Select a port explicitly: automatic matching requires exactly one CH340 candidate".into()))
-                        } else {
-                            let name = &candidates[0].name;
+                    Ok(p) => match auto_select_candidate(&p) {
+                        Ok(candidate) => {
+                            let name = &candidate.name;
                             match connect(name, swap_xy) {
                                 Ok((l, s)) => {
                                     link = Some(l);
@@ -1248,7 +1270,8 @@ fn worker_loop(
                                 Err(e) => emit(DeviceEvent::Error(e)),
                             }
                         }
-                    }
+                        Err(e) => emit(DeviceEvent::Error(e)),
+                    },
                     Err(e) => emit(DeviceEvent::Error(e)),
                     }
                 }
@@ -5575,5 +5598,27 @@ mod tests {
         let p: PortInfo = serde_json::from_value(json).unwrap();
         assert_eq!(p.kind, PortKind::Other);
         assert_eq!(p.mac, None);
+    }
+
+    fn port(name: &str, kind: PortKind, preferred: bool) -> PortInfo {
+        PortInfo { name: name.into(), description: String::new(), preferred, kind, mac: None }
+    }
+
+    #[test]
+    fn auto_select_accepts_a_single_bluetooth_port() {
+        let ports = [port("COM7", PortKind::Bluetooth, true), port("COM6", PortKind::Other, false)];
+        assert_eq!(auto_select_candidate(&ports).unwrap().name, "COM7");
+    }
+
+    #[test]
+    fn auto_select_prefers_usb_and_refuses_ambiguity() {
+        let both = [port("COM13", PortKind::Usb, true), port("COM7", PortKind::Bluetooth, true)];
+        assert_eq!(auto_select_candidate(&both).unwrap().name, "COM13");
+
+        let two_usb = [port("COM13", PortKind::Usb, true), port("COM14", PortKind::Usb, true)];
+        assert!(auto_select_candidate(&two_usb).is_err());
+
+        let none = [port("COM6", PortKind::Other, false)];
+        assert!(auto_select_candidate(&none).is_err());
     }
 }
