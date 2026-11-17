@@ -6,6 +6,7 @@ mod clipboard;
 mod project;
 mod paper;
 mod device;
+mod bluetooth;
 mod glyphs;
 mod inkfont_import;
 mod inkfont;
