@@ -40,9 +40,13 @@ pub struct PortInfo {
     pub mac: Option<String>,
 }
 
-/// True when `mac` names a real Bluetooth peer. Windows leaves the all-zero
-/// address on ghost SPP rows, and a missing or malformed address identifies no
-/// device at all, so neither can be a plotter.
+/// True when `mac` is a syntactically valid, non-zero Bluetooth address.
+///
+/// This rules out Windows' ghost SPP rows (all-zero address) and rows whose
+/// address cannot be parsed at all. It does not identify a plotter: a headset's
+/// SPP row carries a perfectly good MAC and passes. Separating a plotter from a
+/// headset needs the remembered MAC the UI supplies, so a lone headset port is
+/// still offered here and fails later at the GRBL handshake.
 fn usable_bluetooth_mac(mac: &Option<String>) -> bool {
     mac.as_deref()
         .and_then(crate::bluetooth::Mac::parse)
@@ -67,11 +71,12 @@ fn single_preferred(ports: &[PortInfo], kind: PortKind) -> Option<&PortInfo> {
 }
 
 /// Resolve the port automatic connection may use: a lone preferred USB (CH340)
-/// bridge wins, otherwise a lone preferred Bluetooth SPP plotter carrying a real
-/// MAC address. Zero-MAC ghost ports are never candidates; a missing or
-/// malformed MAC disqualifies a Bluetooth port. More than one remaining
-/// Bluetooth port is still ambiguous and refused, because telling a plotter from
-/// a headset needs a remembered MAC, which the UI adds later.
+/// bridge wins, otherwise a lone preferred Bluetooth port carrying a valid MAC
+/// address. Zero-MAC ghost ports and unparseable addresses are never candidates.
+/// More than one remaining Bluetooth port is still ambiguous and refused, because
+/// telling a plotter from a headset needs a remembered MAC, which the UI adds
+/// later — so on a machine that has SPP ports for headsets, auto-connect stays
+/// refused until that rule exists.
 pub fn auto_select_candidate(ports: &[PortInfo]) -> Result<&PortInfo, String> {
     if let Some(usb) = single_preferred(ports, PortKind::Usb) {
         return Ok(usb);
@@ -5800,7 +5805,39 @@ mod tests {
     fn auto_select_refuses_two_real_bluetooth_ports() {
         let plotter = port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2");
         let headset = port_with_mac("COM4", PortKind::Bluetooth, true, "41:42:BC:65:9F:A8");
-        assert!(auto_select_candidate(&[plotter, headset]).is_err());
+        let err = auto_select_candidate(&[plotter, headset]).unwrap_err();
+        assert_eq!(err, "请手动选择串口：自动识别要求恰好一台 CH340 或一台已绑定的蓝牙写字机");
+    }
+
+    /// The reason the MAC filter exists: ghost rows must not manufacture
+    /// ambiguity. Without the filter this machine's ghosts would outvote the
+    /// one real plotter and auto-connect could never work.
+    #[test]
+    fn auto_select_ignores_ghost_ports_beside_the_real_plotter() {
+        let ports = [
+            port_with_mac("COM3", PortKind::Bluetooth, true, "00:00:00:00:00:00"),
+            port_with_mac("COM5", PortKind::Bluetooth, true, "00:00:00:00:00:00"),
+            port_with_mac("COM16", PortKind::Bluetooth, true, "00:00:00:00:00:00"),
+            port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2"),
+        ];
+        assert_eq!(auto_select_candidate(&ports).unwrap().name, "COM7");
+    }
+
+    /// This machine's real SPP rows. Headset ports survive the MAC filter, so
+    /// auto-connect is refused here until the remembered-MAC rule lands with
+    /// the UI — refusing loudly beats silently driving a headset.
+    #[test]
+    fn auto_select_refuses_this_machines_headset_ports() {
+        let ports = [
+            port_with_mac("COM3", PortKind::Bluetooth, true, "00:00:00:00:00:00"),
+            port_with_mac("COM16", PortKind::Bluetooth, true, "00:00:00:00:00:00"),
+            port_with_mac("COM5", PortKind::Bluetooth, true, "00:00:00:00:00:00"),
+            port_with_mac("COM4", PortKind::Bluetooth, true, "11:11:11:11:27:A9"),
+            port_with_mac("COM6", PortKind::Bluetooth, true, "41:42:BC:65:9F:A8"),
+            port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2"),
+            port_with_mac("COM17", PortKind::Bluetooth, true, "A4:62:1A:9C:26:EA"),
+        ];
+        assert!(auto_select_candidate(&ports).is_err());
     }
 
     #[test]
