@@ -40,10 +40,25 @@ pub struct PortInfo {
     pub mac: Option<String>,
 }
 
+/// True when `mac` names a real Bluetooth peer. Windows leaves the all-zero
+/// address on ghost SPP rows, and a missing or malformed address identifies no
+/// device at all, so neither can be a plotter.
+fn usable_bluetooth_mac(mac: &Option<String>) -> bool {
+    mac.as_deref()
+        .and_then(crate::bluetooth::Mac::parse)
+        .is_some_and(|mac| !mac.is_zero())
+}
+
 /// A port that is the only preferred candidate of its link kind. Two or more
-/// candidates of the same kind are ambiguous, so they are not offered.
+/// candidates of the same kind are ambiguous, so they are not offered. A
+/// Bluetooth port additionally needs a usable MAC: without one it is not a
+/// candidate at all, which keeps Windows' zero-MAC ghost ports out.
 fn single_preferred(ports: &[PortInfo], kind: PortKind) -> Option<&PortInfo> {
-    let mut candidates = ports.iter().filter(|p| p.preferred && p.kind == kind);
+    let mut candidates = ports.iter().filter(|p| {
+        p.preferred
+            && p.kind == kind
+            && (kind != PortKind::Bluetooth || usable_bluetooth_mac(&p.mac))
+    });
     let first = candidates.next()?;
     if candidates.next().is_some() {
         return None;
@@ -52,9 +67,11 @@ fn single_preferred(ports: &[PortInfo], kind: PortKind) -> Option<&PortInfo> {
 }
 
 /// Resolve the port automatic connection may use: a lone preferred USB (CH340)
-/// bridge wins, otherwise a lone preferred Bluetooth SPP plotter. Anything else
-/// - including stale Bluetooth ports that are not usable plotters - is refused
-/// instead of guessed.
+/// bridge wins, otherwise a lone preferred Bluetooth SPP plotter carrying a real
+/// MAC address. Zero-MAC ghost ports are never candidates; a missing or
+/// malformed MAC disqualifies a Bluetooth port. More than one remaining
+/// Bluetooth port is still ambiguous and refused, because telling a plotter from
+/// a headset needs a remembered MAC, which the UI adds later.
 pub fn auto_select_candidate(ports: &[PortInfo]) -> Result<&PortInfo, String> {
     if let Some(usb) = single_preferred(ports, PortKind::Usb) {
         return Ok(usb);
@@ -5738,21 +5755,66 @@ mod tests {
         PortInfo { name: name.into(), description: String::new(), preferred, kind, mac: None }
     }
 
+    fn port_with_mac(name: &str, kind: PortKind, preferred: bool, mac: &str) -> PortInfo {
+        PortInfo {
+            name: name.into(),
+            description: String::new(),
+            preferred,
+            kind,
+            mac: Some(mac.into()),
+        }
+    }
+
     #[test]
     fn auto_select_accepts_a_single_bluetooth_port() {
-        let ports = [port("COM7", PortKind::Bluetooth, true), port("COM6", PortKind::Other, false)];
+        let ports = [
+            port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2"),
+            port("COM6", PortKind::Other, false),
+        ];
         assert_eq!(auto_select_candidate(&ports).unwrap().name, "COM7");
     }
 
     #[test]
     fn auto_select_prefers_usb_and_refuses_ambiguity() {
-        let both = [port("COM13", PortKind::Usb, true), port("COM7", PortKind::Bluetooth, true)];
+        let both = [
+            port("COM13", PortKind::Usb, true),
+            port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2"),
+        ];
         assert_eq!(auto_select_candidate(&both).unwrap().name, "COM13");
 
         let two_usb = [port("COM13", PortKind::Usb, true), port("COM14", PortKind::Usb, true)];
-        assert!(auto_select_candidate(&two_usb).is_err());
+        let err = auto_select_candidate(&two_usb).unwrap_err();
+        assert_eq!(err, "请手动选择串口：自动识别要求恰好一台 CH340 或一台已绑定的蓝牙写字机");
 
         let none = [port("COM6", PortKind::Other, false)];
         assert!(auto_select_candidate(&none).is_err());
+    }
+
+    #[test]
+    fn auto_select_never_picks_a_zero_mac_bluetooth_port() {
+        let ghost = [port_with_mac("COM3", PortKind::Bluetooth, true, "00:00:00:00:00:00")];
+        assert!(auto_select_candidate(&ghost).is_err());
+    }
+
+    #[test]
+    fn auto_select_refuses_two_real_bluetooth_ports() {
+        let plotter = port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2");
+        let headset = port_with_mac("COM4", PortKind::Bluetooth, true, "41:42:BC:65:9F:A8");
+        assert!(auto_select_candidate(&[plotter, headset]).is_err());
+    }
+
+    #[test]
+    fn auto_select_refuses_a_bluetooth_port_without_a_usable_mac() {
+        let untagged = [port("COM7", PortKind::Bluetooth, true)];
+        assert!(auto_select_candidate(&untagged).is_err());
+
+        let broken = [port_with_mac("COM7", PortKind::Bluetooth, true, "not-a-mac")];
+        assert!(auto_select_candidate(&broken).is_err());
+    }
+
+    #[test]
+    fn auto_select_accepts_a_lone_usable_bluetooth_port() {
+        let plotter = [port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2")];
+        assert_eq!(auto_select_candidate(&plotter).unwrap().name, "COM7");
     }
 }
