@@ -19,11 +19,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Link type of a discovered port, so the UI can tell a USB bridge (CH340)
+/// apart from a Bluetooth SPP virtual COM port.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortKind {
+    Usb,
+    Bluetooth,
+    #[default]
+    Other,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortInfo {
     pub name: String,
     pub description: String,
     pub preferred: bool,
+    #[serde(default)]
+    pub kind: PortKind,
+    #[serde(default)]
+    pub mac: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Status {
@@ -160,7 +174,7 @@ impl DeviceService {
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(|p| {
-                let (description, preferred) = match p.port_type {
+                let (description, preferred, kind) = match p.port_type {
                     SerialPortType::UsbPort(u) => (
                         format!(
                             "{} {:04X}:{:04X}",
@@ -169,13 +183,16 @@ impl DeviceService {
                             u.pid
                         ),
                         u.vid == 0x1a86 && matches!(u.pid, 0x7523 | 0x5523),
+                        PortKind::Usb,
                     ),
-                    _ => ("Serial port".into(), false),
+                    _ => ("Serial port".into(), false, PortKind::Other),
                 };
                 PortInfo {
                     name: p.port_name,
                     description,
                     preferred,
+                    kind,
+                    mac: None,
                 }
             })
             .collect();
@@ -5514,5 +5531,29 @@ mod tests {
                 "closing alone must not reset a controller"
             );
         }
+    }
+
+    #[test]
+    fn bluetooth_port_info_carries_kind_and_mac() {
+        let p = PortInfo {
+            name: "COM7".into(),
+            description: "蓝牙串口 · 70:4B:CA:72:AC:A2".into(),
+            preferred: true,
+            kind: PortKind::Bluetooth,
+            mac: Some("70:4B:CA:72:AC:A2".into()),
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["kind"], "bluetooth");
+        assert_eq!(json["mac"], "70:4B:CA:72:AC:A2");
+        let back: PortInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, PortKind::Bluetooth);
+    }
+
+    #[test]
+    fn port_info_without_kind_still_deserializes() {
+        let json = serde_json::json!({"name":"COM13","description":"USB","preferred":true});
+        let p: PortInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(p.kind, PortKind::Other);
+        assert_eq!(p.mac, None);
     }
 }
