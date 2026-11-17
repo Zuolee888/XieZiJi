@@ -196,6 +196,26 @@ impl DeviceService {
                 }
             })
             .collect();
+        // A paired SPP plotter is just another virtual COM port, so anything the
+        // registry says is Bluetooth gets tagged instead of added twice.
+        for spp in crate::bluetooth::spp_ports() {
+            let mac = spp.mac.to_string();
+            match ports.iter_mut().find(|p| p.name == spp.port_name) {
+                Some(port) => {
+                    port.kind = PortKind::Bluetooth;
+                    port.mac = Some(mac.clone());
+                    port.description = format!("蓝牙串口 · {mac}");
+                    port.preferred = true;
+                }
+                None => ports.push(PortInfo {
+                    name: spp.port_name.clone(),
+                    description: format!("蓝牙串口 · {mac}"),
+                    preferred: true,
+                    kind: PortKind::Bluetooth,
+                    mac: Some(mac),
+                }),
+            }
+        }
         ports.sort_by_key(|p| (!p.preferred, p.name.clone()));
         Ok(ports)
     }

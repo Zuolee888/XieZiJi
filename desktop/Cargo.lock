@@ -2272,6 +2272,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "ttf-parser",
  "usvg",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

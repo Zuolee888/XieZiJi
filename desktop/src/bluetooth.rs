@@ -1,6 +1,8 @@
 //! Bluetooth (SPP) support: MAC address parsing in Windows registry byte order,
-//! and turning Windows registry rows into SPP COM ports.
+//! turning Windows registry rows into SPP COM ports, and the Windows backend
+//! (bthprops + registry) that lists devices and creates SPP ports.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Serial Port Profile service GUID: the prefix of an SPP port's registry key.
@@ -140,6 +142,395 @@ pub fn choose_port_for_mac<'a>(ports: &'a [SppPort], mac: Mac) -> Option<&'a Spp
     ports.iter().find(|port| port.mac == mac)
 }
 
+/// A discovered (or remembered) Bluetooth device.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BtDevice {
+    pub mac: String,
+    pub name: String,
+    pub remembered: bool,
+    pub authenticated: bool,
+}
+
+/// The system Bluetooth operations this app needs.
+///
+/// A SPP device appears to Windows as a virtual COM port once its service is
+/// enabled, so the rest of the app keeps using the plain serial code.
+pub trait BluetoothBackend: Send + Sync {
+    fn scan(&self, seconds: u8) -> Result<Vec<BtDevice>, String>;
+    fn spp_ports(&self) -> Result<Vec<SppPort>, String>;
+    fn ensure_spp(&self, mac: Mac) -> Result<(), String>;
+    fn forget(&self, mac: Mac) -> Result<(), String>;
+}
+
+/// Turns a Win32 error code into text a user can act on.
+pub fn describe_error(rc: u32) -> String {
+    match rc {
+        0 => "成功".into(),
+        258 => "设备没有响应，请确认写字机已开机且未被手机占用".into(),
+        1244 => "该设备需要先在系统设置里配对，请先在 Windows 蓝牙设置中完成配对后重试".into(),
+        259 => "未找到蓝牙适配器或设备列表已结束，请确认本机蓝牙已开启".into(),
+        other => format!("蓝牙操作失败（错误码 {other}）"),
+    }
+}
+
+/// Builds a [`BtDevice`] from the raw Win32 fields.
+///
+/// `fRemembered` / `fAuthenticated` are `BOOL`s that carry flags (`16`, `8`),
+/// not `0`/`1`, so they must be compared against zero rather than read as bool.
+pub fn bt_device_from(mac: &str, name: &str, remembered: i32, authenticated: i32) -> BtDevice {
+    BtDevice {
+        mac: mac.to_uppercase(),
+        name: name.into(),
+        remembered: remembered != 0,
+        authenticated: authenticated != 0,
+    }
+}
+
+/// SPP ports currently registered with Windows.
+pub fn spp_ports() -> Vec<SppPort> {
+    backend().spp_ports().unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+pub struct EmptyBackend;
+
+#[cfg(not(windows))]
+impl BluetoothBackend for EmptyBackend {
+    fn scan(&self, _seconds: u8) -> Result<Vec<BtDevice>, String> {
+        Err(NOT_ONLY_WINDOWS.into())
+    }
+    fn spp_ports(&self) -> Result<Vec<SppPort>, String> {
+        Err(NOT_ONLY_WINDOWS.into())
+    }
+    fn ensure_spp(&self, _mac: Mac) -> Result<(), String> {
+        Err(NOT_ONLY_WINDOWS.into())
+    }
+    fn forget(&self, _mac: Mac) -> Result<(), String> {
+        Err(NOT_ONLY_WINDOWS.into())
+    }
+}
+
+#[cfg(not(windows))]
+const NOT_ONLY_WINDOWS: &str = "蓝牙连接目前只在 Windows 上提供";
+
+/// The platform backend.
+#[cfg(windows)]
+pub fn backend() -> Box<dyn BluetoothBackend> {
+    Box::new(win::WindowsBackend)
+}
+
+#[cfg(not(windows))]
+pub fn backend() -> Box<dyn BluetoothBackend> {
+    Box::new(EmptyBackend)
+}
+
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use std::{mem, ptr};
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::Devices::Bluetooth::{
+        BluetoothFindDeviceClose, BluetoothFindFirstDevice, BluetoothFindFirstRadio,
+        BluetoothFindNextDevice, BluetoothFindRadioClose,
+        BluetoothGetDeviceInfo, BluetoothRemoveDevice, BluetoothSetServiceState,
+        BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS,
+        BLUETOOTH_SERVICE_ENABLE,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, TRUE};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE,
+        KEY_READ, REG_SZ,
+    };
+
+    pub struct WindowsBackend;
+
+    const BTHENUM: &str = "SYSTEM\\CurrentControlSet\\Enum\\BTHENUM";
+
+    /// The Serial Port Profile service GUID, written out by hand so no
+    /// conversion helper is needed.
+    fn spp_guid() -> GUID {
+        GUID {
+            data1: 0x0000_1101,
+            data2: 0x0000,
+            data3: 0x1000,
+            data4: [0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb],
+        }
+    }
+
+    /// Closes a radio find handle and the radio handle it yielded.
+    struct RadioFind(windows_sys::Win32::Devices::Bluetooth::HBLUETOOTH_RADIO_FIND);
+
+    impl Drop for RadioFind {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    BluetoothFindRadioClose(self.0);
+                }
+            }
+        }
+    }
+
+    struct DeviceFind(windows_sys::Win32::Devices::Bluetooth::HBLUETOOTH_DEVICE_FIND);
+
+    impl Drop for DeviceFind {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    BluetoothFindDeviceClose(self.0);
+                }
+            }
+        }
+    }
+
+    /// A radio handle must be closed with `CloseHandle`, not by the find API.
+    struct Radio(HANDLE);
+
+    impl Drop for Radio {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Reads up to the first NUL and no further: `szName` is 248 wide chars and
+    /// the device name is much shorter, so converting all of it would append a
+    /// wall of NULs.
+    fn name_from_sz(sz: &[u16; 248]) -> String {
+        let end = sz.iter().position(|&c| c == 0).unwrap_or(sz.len());
+        String::from_utf16_lossy(&sz[..end])
+    }
+
+    /// Opens the first Bluetooth radio. The find handle is closed before
+    /// returning; the radio itself is closed by the caller via `Radio`.
+    fn first_radio() -> Result<Radio, String> {
+        let mut radio: HANDLE = ptr::null_mut();
+        let params = BLUETOOTH_FIND_RADIO_PARAMS {
+            dwSize: mem::size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
+        };
+        let find = unsafe { BluetoothFindFirstRadio(&params, &mut radio) };
+        if find.is_null() {
+            return Err(describe_error(ERROR_NO_MORE_ITEMS));
+        }
+        // The guard closes the find handle on every path below, including the
+        // early return for a null radio.
+        let find = RadioFind(find);
+        if radio.is_null() {
+            return Err(describe_error(ERROR_NO_MORE_ITEMS));
+        }
+        drop(find);
+        Ok(Radio(radio))
+    }
+
+    impl BluetoothBackend for WindowsBackend {
+        fn scan(&self, seconds: u8) -> Result<Vec<BtDevice>, String> {
+            let radio = first_radio()?;
+            let params = BLUETOOTH_DEVICE_SEARCH_PARAMS {
+                dwSize: mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
+                fReturnAuthenticated: TRUE,
+                fReturnRemembered: TRUE,
+                fReturnUnknown: TRUE,
+                fReturnConnected: TRUE,
+                fIssueInquiry: TRUE,
+                cTimeoutMultiplier: seconds,
+                hRadio: radio.0,
+            };
+            let mut info = BLUETOOTH_DEVICE_INFO {
+                dwSize: mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
+                ..Default::default()
+            };
+            let find = unsafe { BluetoothFindFirstDevice(&params, &mut info) };
+            if find.is_null() {
+                // No matching device is not an error: the caller shows an empty list.
+                return Ok(Vec::new());
+            }
+            let find = DeviceFind(find);
+            let mut devices = Vec::new();
+            loop {
+                info.dwSize = mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
+                let mac = Mac::from_ull(unsafe { info.Address.Anonymous.ullLong });
+                devices.push(bt_device_from(
+                    &mac.to_string(),
+                    &name_from_sz(&info.szName),
+                    info.fRemembered,
+                    info.fAuthenticated,
+                ));
+                if unsafe { BluetoothFindNextDevice(find.0, &mut info) } == 0 {
+                    break;
+                }
+            }
+            drop(find);
+            Ok(devices)
+        }
+
+        fn spp_ports(&self) -> Result<Vec<SppPort>, String> {
+            let root = wide(BTHENUM);
+            let mut key: HKEY = ptr::null_mut();
+            let rc = unsafe {
+                RegOpenKeyExW(HKEY_LOCAL_MACHINE, root.as_ptr(), 0, KEY_READ, &mut key)
+            };
+            if rc != ERROR_SUCCESS {
+                return Err(describe_error(rc));
+            }
+            let root = RegKey(key);
+
+            let mut rows = Vec::new();
+            for service in subkeys(root.0)? {
+                let Some(service_key) = open_subkey(root.0, &service) else {
+                    continue;
+                };
+                let service_key = RegKey(service_key);
+                let Ok(instances) = subkeys(service_key.0) else {
+                    continue;
+                };
+                for instance in instances {
+                    let Some(port_name) = port_name_of(service_key.0, &instance) else {
+                        continue;
+                    };
+                    rows.push(RegistryInstance {
+                        key: service.clone(),
+                        instance,
+                        port_name,
+                    });
+                }
+            }
+            Ok(spp_ports_from_instances(&rows))
+        }
+
+        fn ensure_spp(&self, mac: Mac) -> Result<(), String> {
+            let radio = first_radio()?;
+            // dwSize must be set before every BluetoothGetDeviceInfo call; the
+            // API reads it to decide the struct layout and returns garbage
+            // otherwise.
+            let mut info = BLUETOOTH_DEVICE_INFO {
+                dwSize: mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
+                Address: windows_sys::Win32::Devices::Bluetooth::BLUETOOTH_ADDRESS {
+                    Anonymous: windows_sys::Win32::Devices::Bluetooth::BLUETOOTH_ADDRESS_0 {
+                        ullLong: mac.to_ull(),
+                    },
+                },
+                ..Default::default()
+            };
+            info.dwSize = mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
+            let rc = unsafe { BluetoothGetDeviceInfo(radio.0, &mut info) };
+            if rc != ERROR_SUCCESS {
+                return Err(describe_error(rc));
+            }
+            let guid = spp_guid();
+            let rc = unsafe { BluetoothSetServiceState(radio.0, &info, &guid, BLUETOOTH_SERVICE_ENABLE) };
+            if rc != ERROR_SUCCESS {
+                return Err(describe_error(rc));
+            }
+            Ok(())
+        }
+
+        fn forget(&self, mac: Mac) -> Result<(), String> {
+            let address = windows_sys::Win32::Devices::Bluetooth::BLUETOOTH_ADDRESS {
+                Anonymous: windows_sys::Win32::Devices::Bluetooth::BLUETOOTH_ADDRESS_0 {
+                    ullLong: mac.to_ull(),
+                },
+            };
+            let rc = unsafe { BluetoothRemoveDevice(&address) };
+            if rc != ERROR_SUCCESS {
+                return Err(describe_error(rc));
+            }
+            Ok(())
+        }
+    }
+
+    struct RegKey(HKEY);
+
+    impl Drop for RegKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+
+    fn open_subkey(parent: HKEY, name: &str) -> Option<HKEY> {
+        let name = wide(name);
+        let mut key: HKEY = ptr::null_mut();
+        let rc = unsafe { RegOpenKeyExW(parent, name.as_ptr(), 0, KEY_READ, &mut key) };
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        Some(key)
+    }
+
+    /// Enumerates the immediate subkeys of `parent`.
+    fn subkeys(parent: HKEY) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        let mut index = 0;
+        loop {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = unsafe {
+                RegEnumKeyExW(
+                    parent,
+                    index,
+                    buf.as_mut_ptr(),
+                    &mut len,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            if rc == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            if rc != ERROR_SUCCESS {
+                return Err(describe_error(rc));
+            }
+            names.push(String::from_utf16_lossy(&buf[..len as usize]));
+            index += 1;
+        }
+        Ok(names)
+    }
+
+    /// Reads `Device Parameters\PortName` for one instance, as `REG_SZ`.
+    fn port_name_of(service_key: HKEY, instance: &str) -> Option<String> {
+        let params = open_subkey(service_key, instance)?;
+        let params = RegKey(params);
+        let device_params = open_subkey(params.0, "Device Parameters")?;
+        let device_params = RegKey(device_params);
+
+        let value_name = wide("PortName");
+        let mut ty = 0u32;
+        let mut bytes = [0u8; 64];
+        let mut size = bytes.len() as u32;
+        let rc = unsafe {
+            RegQueryValueExW(
+                device_params.0,
+                value_name.as_ptr(),
+                ptr::null(),
+                &mut ty,
+                bytes.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        if rc != ERROR_SUCCESS || ty != REG_SZ {
+            return None;
+        }
+        let chars: Vec<u16> = bytes[..size as usize]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+        let port = String::from_utf16_lossy(&chars[..end]);
+        (!port.is_empty()).then_some(port)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +619,28 @@ mod tests {
         assert_eq!(choose_port_for_mac(&ports, writer).unwrap().port_name, "COM7");
         assert!(choose_port_for_mac(&ports, Mac::parse("00:00:00:00:00:00").unwrap()).is_none());
         assert!(choose_port_for_mac(&ports, Mac::parse("AA:BB:CC:DD:EE:FF").unwrap()).is_none());
+    }
+
+    #[test]
+    fn win32_error_codes_become_actionable_chinese() {
+        assert!(describe_error(0).contains("成功"));
+        assert!(describe_error(258).contains("没有响应")); // WAIT_TIMEOUT
+        assert!(describe_error(1244).contains("系统设置里配对")); // ERROR_NOT_AUTHENTICATED
+        assert!(describe_error(259).contains("蓝牙适配器")); // ERROR_NO_MORE_ITEMS
+        assert!(describe_error(9999).contains("9999")); // 未知码回显原码
+    }
+
+    #[test]
+    fn remembered_and_authenticated_are_ints_not_bools() {
+        // BtWriter reports fAuthenticated=0, fRemembered=16 — both true-ish/absent.
+        let writer = bt_device_from("70:4B:CA:72:AC:A2", "BtWriter", 16, 0);
+        assert!(writer.remembered);
+        assert!(!writer.authenticated);
+        let headset = bt_device_from("41:42:BC:65:9F:A8", "ROSE OpenFeel", 16, 8);
+        assert!(headset.remembered);
+        assert!(headset.authenticated);
+        let fresh = bt_device_from("AA:BB:CC:DD:EE:FF", "X", 0, 0);
+        assert!(!fresh.remembered && !fresh.authenticated);
     }
 
     #[test]
