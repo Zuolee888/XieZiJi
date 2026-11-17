@@ -236,7 +236,9 @@ mod win {
         BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS,
         BLUETOOTH_SERVICE_ENABLE,
     };
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, TRUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, TRUE,
+    };
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE,
         KEY_READ, REG_SZ,
@@ -257,7 +259,8 @@ mod win {
         }
     }
 
-    /// Closes a radio find handle and the radio handle it yielded.
+    /// Closes only the radio find handle. The radio handle it yields is a
+    /// separate object and is closed by the `Radio` guard instead.
     struct RadioFind(windows_sys::Win32::Devices::Bluetooth::HBLUETOOTH_RADIO_FIND);
 
     impl Drop for RadioFind {
@@ -307,6 +310,18 @@ mod win {
         String::from_utf16_lossy(&sz[..end])
     }
 
+    /// The error code the API just failed with. `GetLastError` is only
+    /// meaningful immediately after the failing call, so it is read at each
+    /// failure site; `fallback` covers a code that was never set.
+    fn error_code(fallback: u32) -> u32 {
+        let rc = unsafe { GetLastError() };
+        if rc == ERROR_SUCCESS {
+            fallback
+        } else {
+            rc
+        }
+    }
+
     /// Opens the first Bluetooth radio. The find handle is closed before
     /// returning; the radio itself is closed by the caller via `Radio`.
     fn first_radio() -> Result<Radio, String> {
@@ -316,13 +331,13 @@ mod win {
         };
         let find = unsafe { BluetoothFindFirstRadio(&params, &mut radio) };
         if find.is_null() {
-            return Err(describe_error(ERROR_NO_MORE_ITEMS));
+            return Err(describe_error(error_code(ERROR_NO_MORE_ITEMS)));
         }
         // The guard closes the find handle on every path below, including the
         // early return for a null radio.
         let find = RadioFind(find);
         if radio.is_null() {
-            return Err(describe_error(ERROR_NO_MORE_ITEMS));
+            return Err(describe_error(error_code(ERROR_NO_MORE_ITEMS)));
         }
         drop(find);
         Ok(Radio(radio))
@@ -347,8 +362,17 @@ mod win {
             };
             let find = unsafe { BluetoothFindFirstDevice(&params, &mut info) };
             if find.is_null() {
-                // No matching device is not an error: the caller shows an empty list.
-                return Ok(Vec::new());
+                // "Nothing found" and "could not look" both return NULL, so the
+                // two must be told apart here: ERROR_NO_MORE_ITEMS is the normal
+                // empty result the caller renders as an empty list, while
+                // anything else (access denied, a radio that vanished mid-scan,
+                // a bad parameter) is a real failure the user has to see —
+                // otherwise a broken adapter reads as "your plotter is off".
+                let rc = error_code(ERROR_NO_MORE_ITEMS);
+                if rc == ERROR_NO_MORE_ITEMS {
+                    return Ok(Vec::new());
+                }
+                return Err(describe_error(rc));
             }
             let find = DeviceFind(find);
             let mut devices = Vec::new();
@@ -362,6 +386,13 @@ mod win {
                     info.fAuthenticated,
                 ));
                 if unsafe { BluetoothFindNextDevice(find.0, &mut info) } == 0 {
+                    // Same distinction as above: the end of the list is normal,
+                    // a failure part-way through is not. A truncated list would
+                    // hide devices from the picker, so report it instead.
+                    let rc = error_code(ERROR_NO_MORE_ITEMS);
+                    if rc != ERROR_NO_MORE_ITEMS {
+                        return Err(describe_error(rc));
+                    }
                     break;
                 }
             }
