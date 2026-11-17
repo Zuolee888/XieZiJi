@@ -237,6 +237,7 @@ function NumberField({
       <div className="number-input">
         <DraftNumberInput
           type="number"
+          aria-label={label}
           value={value}
           min={min}
           max={max}
@@ -511,15 +512,15 @@ export default function App() {
   }
   const [options, setOptions] = useState<ImportOptions>({
     page: 1,
-    dpi: 300,
+    dpi: 450,
     threshold: 180,
     conservative: false,
     python_path: "python",
     autotrace_path: "",
     tolerance_mm: 0.02,
-    filter_iterations: 4,
-    error_threshold: 2,
-    line_threshold: 1,
+    filter_iterations: 1,
+    error_threshold: 0.5,
+    line_threshold: 0.5,
     despeckle_level: 0,
   });
   const [busy, setBusy] = useState(""),
@@ -533,15 +534,44 @@ export default function App() {
     try { return window.localStorage.getItem("openink-swap-xy") === "true"; }
     catch { return false; }
   });
+  // This shop's machine reports `$3=7`, so the Y motor runs opposite to the
+  // canvas convention. Default on; the switch is persisted per machine.
+  const [flipY, setFlipY] = useState(() => {
+    try {
+      const stored = window.localStorage.getItem("openink-flip-y");
+      return stored === null ? true : stored === "true";
+    } catch { return true; }
+  });
+  // Optional parking point after a completed job. Off by default; the target is
+  // a canvas coordinate in millimetres, converted to machine space when sent.
+  const [parkEnabled, setParkEnabled] = useState(() => {
+    try { return window.localStorage.getItem("openink-park-enabled") === "true"; }
+    catch { return false; }
+  });
+  const [parkX, setParkX] = useState(() => {
+    try { return Number(window.localStorage.getItem("openink-park-x") ?? "0") || 0; }
+    catch { return 0; }
+  });
+  const [parkY, setParkY] = useState(() => {
+    try { return Number(window.localStorage.getItem("openink-park-y") ?? "0") || 0; }
+    catch { return 0; }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("openink-park-enabled", String(parkEnabled));
+      window.localStorage.setItem("openink-park-x", String(parkX));
+      window.localStorage.setItem("openink-park-y", String(parkY));
+    } catch { /* storage is optional; the job still runs without parking */ }
+  }, [parkEnabled, parkX, parkY]);
   const [connecting, setConnecting] = useState(false);
   const [autoConnect, setAutoConnect] = useState(false),
     [running, setRunning] = useState(false),
     [paused, setPaused] = useState(false),
     [progress, setProgress] = useState({ sent: 0, total: 0 });
-  const [feed, setFeed] = useState(1500),
-    [travelFeed, setTravelFeed] = useState(2500),
-    [zFeed, setZFeed] = useState(3000),
-    [zDown, setZDown] = useState(4),
+  const [feed, setFeed] = useState(4500),
+    [travelFeed, setTravelFeed] = useState(3500),
+    [zFeed, setZFeed] = useState(4500),
+    [zDown, setZDown] = useState(6),
     [jogStep, setJogStep] = useState(1);
   const [recovering, setRecovering] = useState(false),
     [connectionError, setConnectionError] = useState(false),
@@ -721,6 +751,13 @@ export default function App() {
       setSwapXY(value);
     } catch { notify("无法保存轴向设置，请检查本机存储后重试", true); }
   }
+  function changeFlipY(value: boolean) {
+    if (connected || connectionAttempt.current || machineBusy) return;
+    try {
+      window.localStorage.setItem("openink-flip-y", String(value));
+      setFlipY(value);
+    } catch { notify("无法保存 Y 轴方向设置，请检查本机存储后重试", true); }
+  }
   async function command(command: Record<string, unknown>) {
     if (recovering) return false;
     const isConnecting = ["connect", "auto_connect", "recover"].includes(
@@ -734,7 +771,7 @@ export default function App() {
       setConfirmedOrigin(null);
     }
     try {
-      await call("device_command", { command: isConnecting ? { ...command, swap_xy: swapXY } : sceneRef.current.request(command) });
+      await call("device_command", { command: isConnecting ? { ...command, swap_xy: swapXY, flip_y: flipY } : sceneRef.current.request(command) });
       return true;
     } catch (e) {
       if (isConnecting) { setConnectionError(true); setConnecting(false); connectionAttempt.current = false; }
@@ -756,7 +793,7 @@ export default function App() {
     setConfirmedOrigin(null);
     notify("正在清除旧任务、恢复连接并抬笔");
     try {
-      await call("device_command", { command: { type: "recover", port, swap_xy: swapXY } });
+      await call("device_command", { command: { type: "recover", port, swap_xy: swapXY, flip_y: flipY } });
     } catch (e) {
       setRecovering(false);
       setConnecting(false);
@@ -1134,6 +1171,7 @@ export default function App() {
       travel_feed: travelFeed,
       z_feed: zFeed,
       z_down: zDown,
+      park: parkEnabled ? [parkX, parkY] as [number, number] : null,
     };
   }
 
@@ -1922,6 +1960,7 @@ export default function App() {
         job: job({ document: scene.document((await currentRoute()).document) }),
         relative: false,
         swap_xy: swapXY,
+        flip_y: flipY,
         origin: automaticOrigin || !confirmedOrigin ? null : Object.values(scene.point({ x: confirmedOrigin[0], y: confirmedOrigin[1] })),
         registration: automaticOrigin ? null : scene.toMachineMapping(registration),
       });
@@ -1936,7 +1975,7 @@ export default function App() {
       return;
     }
     const request = routeRequest!;
-    const frozenJob = { feed, travel_feed: travelFeed, z_feed: zFeed, z_down: zDown };
+    const frozenJob = { feed, travel_feed: travelFeed, z_feed: zFeed, z_down: zDown, park: parkEnabled ? [parkX, parkY] as [number, number] : null };
     submittedBatch.current = { page: canvasPage, id: currentBatch.id, document: preparedDoc! };
     submittedStrokes.current = pendingDoc;
     setActiveJobDocument(preparedDoc);
@@ -1981,6 +2020,7 @@ export default function App() {
         await call("export_gcode", {
           path,
           swap_xy: swapXY,
+          flip_y: flipY,
           job: job({ document: scene.document((await currentRoute()).document) }),
           origin: automaticOrigin || !confirmedOrigin ? null : Object.values(scene.point({ x: confirmedOrigin[0], y: confirmedOrigin[1] })),
           registration: automaticOrigin ? null : scene.toMachineMapping(registration),
@@ -2650,6 +2690,7 @@ export default function App() {
                         <Field label="转换预设">
                           <select
                             className="full-select"
+                            aria-label="转换预设"
                             value={preset}
                             onChange={(e) => applyPreset(e.target.value)}
                           >
@@ -2685,9 +2726,20 @@ export default function App() {
                         </div>
                         <Toggle
                           checked={options.conservative}
-                          onChange={(v) =>
-                            applyPreset(v ? "180-conservative" : "180-default")
-                          }
+                          onChange={(v) => {
+                            setCustomFit(true);
+                            setOptions((o) => ({
+                              ...o,
+                              conservative: v,
+                              ...(v
+                                ? {
+                                    filter_iterations: 0,
+                                    error_threshold: 0.5,
+                                    line_threshold: 0.5,
+                                  }
+                                : {}),
+                            }));
+                          }}
                           label="保守拟合模式"
                         />
                         <details className="advanced-trace">
@@ -2927,7 +2979,7 @@ export default function App() {
                 <div className="paper-corner-host" ref={setPaperCornerHost} hidden={!paperWizard || paperStage !== 1} />
                 <div hidden={!!paperWizard && paperStage === 1} className={`paper-scroll ${pan.panActive ? "pan-ready" : ""} ${pan.panning ? "panning" : ""}`} tabIndex={0} aria-label="画布视图区" {...pan.bind}>
                   <CanvasPointerOverlay toMachinePoint={scene.point} width={template.width_mm} height={template.height_mm} paperWidth={viewSize.width} paperHeight={viewSize.height} origin={coordinateOrigin} registration={registration} host={paperHost.current} onSelectAlignmentPoint={selectingAlignmentPoint ? selectAlignmentPoint : undefined}>
-                  <MachineReference angle={viewRotation} ghost={showMachineReference} paperWidth={paperWidth} paperHeight={paperHeight} />
+                  <MachineReference angle={viewRotation} ghost={showMachineReference} paperWidth={paperWidth} paperHeight={paperHeight} flipY={flipY} />
                   <div
                     className="paper"
                     style={{ width: paperWidth, height: paperHeight, position: "absolute", left: (viewSize.width - paperWidth) / 2, top: (viewSize.height - paperHeight) / 2, transform: `rotate(${viewRotation}deg)` }}
@@ -3456,7 +3508,24 @@ export default function App() {
                       <small>mm</small>
                     </div>
                   </div>
-                  <p className="field-note">落笔下探可调 2–10 mm，默认 4 mm。仅调整作业参数，不修改固件设置。</p>
+                  <p className="field-note">落笔下探可调 2–10 mm，默认 6 mm。仅调整作业参数，不修改固件设置。</p>
+                  <Toggle
+                    label="完成后移至停车点"
+                    checked={parkEnabled}
+                    onChange={setParkEnabled}
+                    disabled={machineBusy}
+                  />
+                  {parkEnabled && (
+                    <div className="calibration-grid">
+                      <CanvasNumber label="停车点 X" ariaLabel="停车点X" value={parkX} onChange={setParkX} />
+                      <CanvasNumber label="停车点 Y" ariaLabel="停车点Y" value={parkY} onChange={setParkY} />
+                    </div>
+                  )}
+                  <p className="field-note">
+                    {parkEnabled
+                      ? "任务正常完成后先抬笔，再按移动速度走到该画布坐标；暂停/停止不会触发。"
+                      : "开启后，任务完成会抬笔并移动到指定画布坐标（mm），默认关闭。"}
+                  </p>
                 </Section>
                 </div>
               </div>
@@ -3544,6 +3613,11 @@ export default function App() {
                       停止
                     </button>
                   </div>
+                  {paused && (
+                    <p className="field-note">
+                      暂停时笔仍压在纸面上，长时间暂停可能洇墨；需要停笔请先点「停止」（会抬笔并复位）。
+                    </p>
+                  )}
                   {progress.total > 0 && (
                     <div className="job-progress">
                       <div>
@@ -4056,6 +4130,10 @@ export default function App() {
                   <>
                     <Toggle label="X/Y 轴对调" checked={swapXY} onChange={changeSwapXY} disabled={!!connected || connecting || machineBusy} />
                     <p className="field-note">按机型交换控制器的 X/Y 轴，书写和点动方向一起调整。此设置保存在本机；请断开连接后修改，再重新校准。</p>
+                    <Toggle label="Y 轴方向反转" checked={flipY} onChange={changeFlipY} disabled={!!connected || connecting || machineBusy} />
+                    <p className="field-note">
+                      当固件把 Y 电机方向接反时（本机 <code>$3=7</code>，字会上下颠倒），打开此项让软件在发送与显示时翻转 Y；无需改固件，也不影响旧版奎享软件。此设置保存在本机，断开连接后修改，重新连接生效。
+                    </p>
                     <p className="modal-description">
                       SVG 原生解析。PDF / 图片与字体中心线转换使用本机 Python 和
                       AutoTrace。

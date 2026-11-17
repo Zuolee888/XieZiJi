@@ -133,10 +133,10 @@ export async function appIntegration(){
  await click('下一笔');assert.ok(document.querySelector('g[aria-label="已选第2笔"]'));assert.equal(document.querySelector('g[aria-label="已选第1笔"]'),null);
  await click('上一笔');assert.ok(document.querySelector('g[aria-label="已选第1笔"]'));assert.deepEqual(shapes(),beforeHide,'Route inspection cannot mutate editor geometry');
  await click('导出 SVG');const exported=requests.filter(r=>r.name==='export_document').at(-1)!.args.document;
- assert.equal((document.querySelector('input[aria-label="描线速率"]') as HTMLInputElement).value,'1500');
- assert.equal((document.querySelector('input[aria-label="移动速度"]') as HTMLInputElement).value,'2500');
- assert.equal((document.querySelector('input[aria-label="Z速率"]') as HTMLInputElement).value,'3000');
- assert.equal((document.querySelector('input[aria-label="落笔下探"]') as HTMLInputElement).value,'4');
+ assert.equal((document.querySelector('input[aria-label="描线速率"]') as HTMLInputElement).value,'4500');
+ assert.equal((document.querySelector('input[aria-label="移动速度"]') as HTMLInputElement).value,'3500');
+ assert.equal((document.querySelector('input[aria-label="Z速率"]') as HTMLInputElement).value,'4500');
+ assert.equal((document.querySelector('input[aria-label="落笔下探"]') as HTMLInputElement).value,'6');
  await number('落笔下探',1);assert.equal((document.querySelector('input[aria-label="落笔下探"]') as HTMLInputElement).value,'2');
  await number('落笔下探',11);assert.equal((document.querySelector('input[aria-label="落笔下探"]') as HTMLInputElement).value,'10');await number('落笔下探',7);
  await click('预览 CNC / G-code');const generated=requests.filter(r=>r.name==='generate_gcode').at(-1)!.args.job.document;
@@ -200,6 +200,11 @@ async function sourceParity(kind:'pdf'|'gfont'){
    assert.ok(!requests.some(r=>r.name==='list_legacy_fonts'),'Public startup must not call private commands');
    assert.equal(document.querySelector('.legacy-picker'),null);
    await click('导入素材…');assert.equal(requests.find(r=>r.name==='import_document')?.args.path,'/offline/current-upload.pdf');
+   assert.equal((document.querySelector('select.full-select') as HTMLSelectElement).value,'custom','PDF import defaults to the custom conversion preset');
+   assert.equal((document.querySelector('input[aria-label="栅格分辨率"]') as HTMLInputElement).value,'450');
+   assert.equal((document.querySelector('input[aria-label="预平滑次数"]') as HTMLInputElement).value,'1');
+   assert.equal((document.querySelector('input[aria-label="曲线拟合误差"]') as HTMLInputElement).value,'0.5');
+   assert.equal((document.querySelector('input[aria-label="直线判定误差"]') as HTMLInputElement).value,'0.5');
  }else{
    const select=[...document.querySelectorAll('select')].find(s=>[...s.options].some(o=>o.value==='legacy'))!;assert.ok(select);
    await act(async()=>{select.value='legacy';select.dispatchEvent(new Event('change',{bubbles:true}));});
@@ -401,7 +406,7 @@ async function routeComparisonChecks(){
  events.push({type:'stopped'},{type:'status',status:{state:'Idle',position:[0,0,0],wco:[0,0,0]}});await poll();await click('优化轨迹');assert.equal(findButton('优化轨迹').getAttribute('aria-pressed'),'false');
  await click('优化书写对照');
  const compared=requests.filter(r=>r.name==='compare_routes').at(-1)!.args;
- assert.equal(compared.official_baseline,false,'SVG/PDF references cannot claim official gfont order');assert.equal(compared.job.z_down,4);assert.equal(compared.job.feed,1500);assert.equal(compared.job.travel_feed,2500);assert.equal(compared.trajectory_enabled,false);assert.equal(compared.max_gap_mm,0);assert.equal(compared.deduplicate,false);
+ assert.equal(compared.official_baseline,false,'SVG/PDF references cannot claim official gfont order');assert.equal(compared.job.z_down,6);assert.equal(compared.job.feed,4500);assert.equal(compared.job.travel_feed,3500);assert.equal(compared.trajectory_enabled,false);assert.equal(compared.max_gap_mm,0);assert.equal(compared.deduplicate,false);
  assert.ok(document.querySelector('svg[aria-label="优化方案墨迹对照"]'));assert.equal(document.querySelector('svg[aria-label="优化方案墨迹对照"] line'),null,'Comparison renders ink only, never full-route travel');
  assert.ok(document.querySelector('[role="dialog"]')?.textContent?.includes('完整用时'));assert.ok(document.querySelector('[role="dialog"]')?.textContent?.includes('不含加减速和通信等待'));
  assert.equal(findButton('应用合并方案').disabled,false,'4.99% savings is a user choice');assert.equal(findButton('应用连写方案').disabled,false);assert.equal([...document.querySelectorAll('button')].some(b=>b.textContent==='应用当前规划'),false,'Trajectory is independently controlled, never applied from comparison');

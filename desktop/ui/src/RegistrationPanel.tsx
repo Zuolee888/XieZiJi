@@ -6,6 +6,11 @@ import { machineScene } from "./machineScene";
 
 export type RegistrationProfile = Registration & { id: string; name: string; width_mm: number; height_mm: number; point1: number[]; point2: number[]; point3?: number[] };
 export type RegistrationSetup = { points: number[][]; point3?: number[]; show_points: boolean; selected_profile: string };
+// This shop starts every two-point calibration with the tip parked on a fixed
+// reference spot: machine coordinates (11, -24.5). The canvas/edit frame used
+// by this panel has Y pointing down, i.e. opposite to the flipped machine Y, so
+// the same spot is (11, +24.5) here.
+const DEFAULT_FIRST_POINT = [11, 24.5];
 export function RegistrationPanel({ width, height, travelFeed, origin, registration, ready, positioning, calibrationVersion, sessionVersion, onCommand, onLock, onPointsChange, errorVersion = 0, pointEdit, editLocked = false, restoreSetup, onSetupChange, onComplete, secondPointVersion = 0, onPositioningStarted, preserveScale = false, scene = machineScene(width, height, 0) }: {
   width: number; height: number; travelFeed: number; origin: number[] | null; registration: Registration;
   ready: boolean; positioning: boolean; calibrationVersion: number; sessionVersion: number;
@@ -22,9 +27,9 @@ export function RegistrationPanel({ width, height, travelFeed, origin, registrat
   preserveScale?: boolean;
   scene?: ReturnType<typeof machineScene>;
 }) {
-  const [point1, setPoint1] = useState(origin || [width, 0]);
+  const [point1, setPoint1] = useState(origin || DEFAULT_FIRST_POINT);
   const [point2, setPoint2] = useState(() => {
-    const first = origin || [width, 0];
+    const first = origin || DEFAULT_FIRST_POINT;
     return [[15, 15], [width - 15, 15], [15, height - 15], [width - 15, height - 15]].sort((a, b) => Math.hypot(b[0] - first[0], b[1] - first[1]) - Math.hypot(a[0] - first[0], a[1] - first[1]))[0];
   });
   const [point3, setPoint3] = useState([width - 15, height - 15]);
@@ -60,7 +65,7 @@ export function RegistrationPanel({ width, height, travelFeed, origin, registrat
   useEffect(() => () => { epoch.current++; }, []);
   useEffect(() => {
     if (pointsEdited.current || active) return;
-    const first = origin || [width, 0];
+    const first = origin || DEFAULT_FIRST_POINT;
     const corners = [[15, 15], [width - 15, 15], [15, height - 15], [width - 15, height - 15]];
     setPoint1(first);
     setPoint2(corners.sort((a, b) => Math.hypot(b[0] - first[0], b[1] - first[1]) - Math.hypot(a[0] - first[0], a[1] - first[1]))[0]);

@@ -2,7 +2,7 @@ import { useId } from "react";
 import { referenceViewSize } from "./pointerGeometry";
 
 /** Fixed software machine axes; the outline does not represent physical travel. */
-export function MachineReference({ angle, ghost, paperWidth, paperHeight }: { angle: number; ghost: boolean; paperWidth: number; paperHeight: number }) {
+export function MachineReference({ angle, ghost, paperWidth, paperHeight, flipY }: { angle: number; ghost: boolean; paperWidth: number; paperHeight: number; flipY: boolean }) {
   const id = useId(), rotation = 0;
   const size = referenceViewSize(paperWidth, paperHeight, angle);
   const width = paperWidth + 24, height = paperHeight + 24;
@@ -20,7 +20,9 @@ export function MachineReference({ angle, ghost, paperWidth, paperHeight }: { an
       <circle r="2" fill="white" stroke="#8b7d9b" strokeWidth=".8" />
       <text transform={`translate(12 -15) rotate(${-rotation})`} fontSize="10" fill="#8a90a1">机器方向参考</text>
       <text transform={`translate(48 0) rotate(${-rotation})`} fontSize="10" fill="#a34848" dominantBaseline="middle">X</text>
-      <text transform={`translate(0 50) rotate(${-rotation})`} fontSize="10" fill="#39766a" textAnchor="middle">+Y</text>
+      {/* The canvas +Y arrow points down. When the Y axis is flipped in software the
+          controller's +Y runs the other way, so the label shows the machine sign. */}
+      <text transform={`translate(0 50) rotate(${-rotation})`} fontSize="10" fill="#39766a" textAnchor="middle">{flipY ? "-Y" : "+Y"}</text>
     </g>
   </svg></>;
 }

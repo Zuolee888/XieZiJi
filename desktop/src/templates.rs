@@ -128,16 +128,31 @@ impl TemplateProvider for TemplateStore {
             },
         ];
         if self.directory.exists() {
+            // One unreadable or corrupt file must not hide every other saved
+            // template, so skip bad entries instead of failing the whole list.
+            let mut seen = std::collections::HashSet::new();
             for entry in fs::read_dir(&self.directory).map_err(|e| e.to_string())? {
-                let path = entry.map_err(|e| e.to_string())?.path();
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
                 if path.extension().and_then(|x| x.to_str()) != Some("json") {
                     continue;
                 }
-                let data = fs::read(&path).map_err(|e| e.to_string())?;
-                let template: Template = serde_json::from_slice(&data)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                Self::validate(&template)?;
-                if !template.id.starts_with("builtin-") {
+                let Ok(data) = fs::read(&path) else {
+                    eprintln!("skip unreadable template: {}", path.display());
+                    continue;
+                };
+                let template: Template = match serde_json::from_slice(&data) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("skip invalid template {}: {e}", path.display());
+                        continue;
+                    }
+                };
+                if Self::validate(&template).is_err() {
+                    eprintln!("skip invalid template: {}", path.display());
+                    continue;
+                }
+                if !template.id.starts_with("builtin-") && seen.insert(template.id.clone()) {
                     items.push(template)
                 }
             }

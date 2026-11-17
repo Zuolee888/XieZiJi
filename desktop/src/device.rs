@@ -78,6 +78,10 @@ pub struct Job {
     pub z_feed: f64,
     #[serde(default = "default_z_down")]
     pub z_down: f64,
+    /// Optional parking point in machine/work millimetres. When set, the job
+    /// lifts the pen to Z0 and then travels there at `travel_feed`.
+    #[serde(default)]
+    pub park: Option<[f64; 2]>,
 }
 pub fn default_z_down() -> f64 {
     4.0
@@ -88,8 +92,15 @@ fn valid_z_down(depth: f64) -> bool {
 #[derive(Debug)]
 pub enum DeviceCommand {
     Scan,
-    AutoConnect { swap_xy: bool },
-    Connect { port: String, swap_xy: bool },
+    AutoConnect {
+        swap_xy: bool,
+        flip_y: bool,
+    },
+    Connect {
+        port: String,
+        swap_xy: bool,
+        flip_y: bool,
+    },
     Disconnect,
     Jog {
         x: f64,
@@ -103,7 +114,11 @@ pub enum DeviceCommand {
     Pause,
     Resume,
     Stop,
-    Recover { port: String, swap_xy: bool },
+    Recover {
+        port: String,
+        swap_xy: bool,
+        flip_y: bool,
+    },
     Calibrate {
         canvas_x: f64,
         canvas_y: f64,
@@ -325,6 +340,83 @@ pub(crate) fn map_xy_axes(line: &str, swap_xy: bool) -> String {
     String::from_utf8(bytes).expect("ASCII axis replacement preserves UTF-8")
 }
 
+/// Machine-specific workaround: some GRBL builds are wired with the Y motor
+/// inverted relative to this app's canvas convention (canvas +Y = away from the
+/// operator). Flipping Y mirrors the axis on the wire and on reported positions,
+/// so jobs, jog and status all stay consistent. Equivalent to clearing bit 1 of
+/// GRBL `$3`, but without touching firmware settings. The UI toggle drives the
+/// runtime switch; `OPENINK_FLIP_Y` (1/0) still overrides it for CLI runs.
+static FLIP_Y_RUNTIME: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_flip_y(enabled: bool) {
+    FLIP_Y_RUNTIME.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn env_flip_y() -> Option<bool> {
+    std::env::var("OPENINK_FLIP_Y").ok().map(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
+pub(crate) fn y_axis_inverted() -> bool {
+    env_flip_y().unwrap_or_else(|| FLIP_Y_RUNTIME.load(Ordering::Relaxed))
+}
+
+/// Negate every Y axis word in a controller line (`Y-12.5` -> `Y12.5`).
+pub(crate) fn map_y_invert(line: &str) -> String {
+    if !line.is_ascii() {
+        return line.to_owned();
+    }
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut i = 0;
+    let mut comment = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' => {
+                out.push_str(&line[i..]);
+                break;
+            }
+            b'(' => {
+                comment = true;
+                out.push('(');
+                i += 1;
+            }
+            b')' => {
+                comment = false;
+                out.push(')');
+                i += 1;
+            }
+            b'Y' if !comment
+                && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+                && bytes
+                    .get(i + 1)
+                    .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.')) =>
+            {
+                let mut j = i + 1;
+                while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b';' {
+                    j += 1;
+                }
+                if let Ok(value) = line[i + 1..j].parse::<f64>() {
+                    let negated = if value == 0.0 { 0.0 } else { -value };
+                    out.push('Y');
+                    out.push_str(&format!("{negated}"));
+                    i = j;
+                } else {
+                    out.push('Y');
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn vector(s: &str, swap_xy: bool) -> Option<[f64; 3]> {
     let v: Vec<f64> = s
         .split(',')
@@ -338,7 +430,12 @@ fn vector(s: &str, swap_xy: bool) -> Option<[f64; 3]> {
         return None;
     }
     let z = v[v.len() - 1];
-    Some(if swap_xy { [v[1], v[0], z] } else { [v[0], v[1], z] })
+    let mapped = if swap_xy { [v[1], v[0], z] } else { [v[0], v[1], z] };
+    Some(if y_axis_inverted() {
+        [mapped[0], -mapped[1], mapped[2]]
+    } else {
+        mapped
+    })
 }
 fn parse_status(s: &str, previous: &Status, swap_xy: bool) -> Option<Status> {
     let mut parts = s.strip_prefix('<')?.strip_suffix('>')?.split('|');
@@ -427,6 +524,19 @@ pub fn build_job(job: &Job, anchor: [f64; 3]) -> Result<Vec<String>, String> {
         }
     }
     lines.push(up);
+    if let Some([park_x, park_y]) = job.park {
+        if !park_x.is_finite() || !park_y.is_finite() {
+            return Err("Parking target must be finite".into());
+        }
+        if ![park_x, park_y].iter().all(|v| (*v as f32).is_finite()) {
+            return Err("Parking target must be controller-representable".into());
+        }
+        // The pen is already at Z0 (last `up`), so this is a safe travel move.
+        lines.push(format!(
+            "G1 X{park_x:.3} Y{park_y:.3} F{}",
+            job.travel_feed
+        ));
+    }
     Ok(lines)
 }
 
@@ -568,9 +678,12 @@ struct Link {
 }
 impl Link {
     fn write(&mut self, b: &[u8]) -> Result<(), String> {
-        if self.swap_xy {
+        let flip_y = y_axis_inverted();
+        if (self.swap_xy || flip_y) && std::str::from_utf8(b).is_ok() {
             if let Ok(line) = std::str::from_utf8(b) {
-                return self.port.write_all(map_xy_axes(line, true).as_bytes()).map_err(|e| e.to_string());
+                let mapped = if self.swap_xy { map_xy_axes(line, true) } else { line.to_owned() };
+                let mapped = if flip_y { map_y_invert(&mapped) } else { mapped };
+                return self.port.write_all(mapped.as_bytes()).map_err(|e| e.to_string());
             }
         }
         self.port.write_all(b).map_err(|e| e.to_string())
@@ -1226,8 +1339,9 @@ fn worker_loop(
                 DeviceCommand::Connect { .. } | DeviceCommand::AutoConnect { .. } if link.is_some() => emit(
                     DeviceEvent::Error("Disconnect before connecting again".into()),
                 ),
-                DeviceCommand::Connect { port: name, swap_xy: requested } => {
+                DeviceCommand::Connect { port: name, swap_xy: requested, flip_y: invert_y } => {
                     swap_xy = requested;
+                    set_flip_y(invert_y);
                     match connect(&name, swap_xy) {
                     Ok((l, s)) => {
                         link = Some(l);
@@ -1246,8 +1360,9 @@ fn worker_loop(
                     Err(e) => emit(DeviceEvent::Error(e)),
                     }
                 }
-                DeviceCommand::AutoConnect { swap_xy: requested } => {
+                DeviceCommand::AutoConnect { swap_xy: requested, flip_y: invert_y } => {
                     swap_xy = requested;
+                    set_flip_y(invert_y);
                     match DeviceService::ports() {
                     Ok(p) => match auto_select_candidate(&p) {
                         Ok(candidate) => {
@@ -1314,13 +1429,14 @@ fn worker_loop(
                         continue;
                     }
                     let target = match c {
-                        DeviceCommand::Recover { port: name, swap_xy: requested } => {
-                            if link.is_some() && requested != swap_xy {
+                        DeviceCommand::Recover { port: name, swap_xy: requested, flip_y: invert_y } => {
+                            if link.is_some() && (requested != swap_xy || invert_y != y_axis_inverted()) {
                                 emit(DeviceEvent::Error("Disconnect before changing the controller axis mapping".into()));
                                 emit(DeviceEvent::Recovering(false));
                                 continue;
                             }
                             swap_xy = requested;
+                            set_flip_y(invert_y);
                             Some(name)
                         },
                         _ => connected_port.clone(),
@@ -2470,7 +2586,25 @@ mod tests {
             travel_feed: 1500.0,
             z_feed: 300.0,
             z_down: default_z_down(),
+            park: None,
         }
+    }
+    #[test]
+    fn build_job_appends_park_move_only_when_requested() {
+        let mut with_park = job();
+        with_park.park = Some([12.5, 8.0]);
+        let lines = build_job(&with_park, [0., 0., 0.]).unwrap();
+        assert_eq!(lines.last().unwrap(), "G1 X12.500 Y8.000 F1500");
+        assert!(
+            lines[lines.len() - 2].starts_with("G1 G90 Z0.000"),
+            "park move must happen after the final pen lift"
+        );
+
+        let lines = build_job(&job(), [0., 0., 0.]).unwrap();
+        assert!(
+            lines.last().unwrap().starts_with("G1 G90 Z0.000"),
+            "without a park target the job still ends with a pen lift only"
+        );
     }
     #[test]
     fn motion_observer_uses_earliest_possible_segment_and_dispatch_limit() {
@@ -3684,7 +3818,7 @@ mod tests {
                                 y: 0.,
                                 feed: 300.,
                             },
-                            DeviceCommand::Recover { port: "mock".into(), swap_xy: false },
+                            DeviceCommand::Recover { port: "mock".into(), swap_xy: false, flip_y: false },
                         ] {
                             tx.send(command).unwrap();
                         }
@@ -4064,7 +4198,7 @@ mod tests {
             y: 0.,
             feed: 300.,
         });
-        service.command(DeviceCommand::Recover { port: "mock".into(), swap_xy: false });
+        service.command(DeviceCommand::Recover { port: "mock".into(), swap_xy: false, flip_y: false });
         service.command(DeviceCommand::Stop);
         assert!(commands.try_recv().is_err());
         assert!(recovery.stop_requested.load(Ordering::SeqCst));
@@ -4850,7 +4984,7 @@ mod tests {
         loop { if let DeviceEvent::Error(e)=rx.recv_timeout(Duration::from_secs(3)).unwrap() {assert!(e.contains("finite"));break} }
         assert_eq!(trace.lock().unwrap().iter().filter(|line|line.starts_with("> G1")).count(), before);
         // A recovery request cannot silently replace the active session's mapping.
-        tx.send(DeviceCommand::Recover {port:"mock".into(),swap_xy:false}).unwrap();
+        tx.send(DeviceCommand::Recover {port:"mock".into(),swap_xy:false,flip_y:false}).unwrap();
         loop { if let DeviceEvent::Error(e)=rx.recv_timeout(Duration::from_secs(3)).unwrap() {assert!(e.contains("axis mapping"));break} }
         drop(tx); handle.join().unwrap();
     }
@@ -5021,7 +5155,7 @@ mod tests {
             wait_positioning_done(&rx);
             tx.send(DeviceCommand::MoveTo { canvas_x:second[0],canvas_y:second[1],feed:1500. }).unwrap();
             assert_eq!(wait_positioning_done(&rx).position,Some([expected[0],expected[1],0.]));
-            let job = Job { document: crate::model::Document { name:"machine scene".into(),width_mm:160.,height_mm:240.,strokes:vec![vec![crate::model::Point{x:first[0],y:first[1]},crate::model::Point{x:second[0],y:second[1]}]] },feed:1200.,travel_feed:1500.,z_feed:300.,z_down:4. };
+            let job = Job { document: crate::model::Document { name:"machine scene".into(),width_mm:160.,height_mm:240.,strokes:vec![vec![crate::model::Point{x:first[0],y:first[1]},crate::model::Point{x:second[0],y:second[1]}]] },feed:1200.,travel_feed:1500.,z_feed:300.,z_down:4., park: None };
             let lines=positioning::registered_job(&job,first,Registration::default()).unwrap();
             assert!(lines.iter().any(|s|s==&format!("G1 X{:.3} Y{:.3} F1200",expected[0],expected[1])),"{lines:?}");
             drop(tx);h.join().unwrap();

@@ -32,6 +32,10 @@ export async function registrationChecks() {
   if (button("画板").getAttribute("aria-pressed") !== "true") await click("画板");
   const details = document.querySelector('.registration-coordinate-details') as HTMLDetailsElement;
   assert.equal(details.open, false, 'Precise point coordinates are collapsed by default');
+  assert.equal((document.querySelector('input[aria-label="第1点X"]') as HTMLInputElement).value, '11', 'Fresh calibration starts on the shop reference point');
+  assert.equal((document.querySelector('input[aria-label="第1点Y"]') as HTMLInputElement).value, '24.5', 'Machine Y -24.5 maps to canvas Y +24.5');
+  assert.equal((document.querySelector('input[aria-label="第2点X"]') as HTMLInputElement).value, '145', 'Second point defaults to the farthest paper corner');
+  assert.equal((document.querySelector('input[aria-label="第2点Y"]') as HTMLInputElement).value, '225');
   const visibility = button('显示校准点');
   assert.equal(visibility.getAttribute('aria-pressed'), 'true');
   assert.ok(visibility.querySelector('.switch.on'), 'Calibration reuses the standard sidebar switch');
@@ -42,7 +46,7 @@ export async function registrationChecks() {
   assert.ok(handle, 'Points are editable directly on the canvas even before connection');
   const beforeMotion = requests.filter(r => r.name === 'device_command').length;
   await act(async () => handle.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowRight', bubbles:true})));
-  assert.equal((document.querySelector('input[aria-label="第2点X"]') as HTMLInputElement).value, '16', 'Canvas point changes reach the numeric panel');
+  assert.equal((document.querySelector('input[aria-label="第2点X"]') as HTMLInputElement).value, '146', 'Canvas point changes reach the numeric panel');
   assert.equal(requests.filter(r => r.name === 'device_command').length, beforeMotion, 'Changing reference points never moves the machine');
   await act(async () => handle.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowLeft', bubbles:true})));
   await act(async () => (details.querySelector('summary') as HTMLElement).click());
@@ -55,7 +59,7 @@ export async function registrationChecks() {
   assert.equal(button('开始书写').disabled, true, 'Setting page scales before calibration cannot silently use unscaled automatic writing');
   await click('画布顺时针旋转 90°');
   const scene = machineScene(160,240,90);
-  const first = scene.point({x:160,y:0});
+  const first = scene.point({x:11,y:24.5});
   await click('将笔尖设定在定位点1');
   const single = command('apply_registration').at(-1)!.args.command;
   assert.deepEqual(single.origin,[first.x,first.y]);
@@ -76,9 +80,9 @@ export async function registrationChecks() {
   assert.equal(command("move_to").length, 0, "Calibration event still waits for positioning completion");
   await poll({ type: "positioning", active: false });
   assert.equal(command("move_to").length, 1);
-  assert.equal(command("move_to")[0].args.command.feed, 2500, "Second point uses the current travel speed required by Rust IPC");
-  const second=scene.point({x:15,y:225});
-  assert.deepEqual(command("move_to")[0].args.command, { type: "move_to", canvas_x: second.x, canvas_y: second.y, feed: 2500 });
+  assert.equal(command("move_to")[0].args.command.feed, 3500, "Second point uses the current travel speed required by Rust IPC");
+  const second=scene.point({x:145,y:225});
+  assert.deepEqual(command("move_to")[0].args.command, { type: "move_to", canvas_x: second.x, canvas_y: second.y, feed: 3500 });
   assert.equal(button("已对齐第二点，完成校准").disabled, true, "Second-point move must complete before confirmation");
   await poll(idle, { type: "positioning", active: false });
   await click("已对齐第二点，完成校准");
@@ -105,7 +109,7 @@ export async function registrationChecks() {
   await click("关闭");
   await click("开始书写");
   const run = command("run").at(-1)!.args.command.job;
-  assert.equal(run.feed, 1500); assert.equal(run.travel_feed, 2500); assert.deepEqual(run.document.strokes, generated.job.document.strokes);
+  assert.equal(run.feed, 4500); assert.equal(run.travel_feed, 3500); assert.deepEqual(run.document.strokes, generated.job.document.strokes);
   await act(async () => root.unmount());
 
   const beforeRestart = command("apply_registration").length;

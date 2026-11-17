@@ -93,6 +93,7 @@ fn write_legacy(args: &[String]) -> Result<Value, String> {
         travel_feed: 1500.,
         z_feed: 300.,
         z_down: 4.,
+        park: None,
     };
     let first = job
         .document
@@ -222,7 +223,11 @@ fn check_connection(port: String) -> Result<Value, String> {
     use crate::device::{DeviceCommand, DeviceEvent, DeviceService};
     use std::time::{Duration, Instant};
     let service = DeviceService::new();
-    service.command(DeviceCommand::Connect { port: port.clone(), swap_xy: false });
+    service.command(DeviceCommand::Connect {
+        port: port.clone(),
+        swap_xy: false,
+        flip_y: crate::device::env_flip_y().unwrap_or(true),
+    });
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut connected = false;
     let mut status = None;

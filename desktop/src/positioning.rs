@@ -168,6 +168,9 @@ pub(crate) fn check_job_travel(
     {
         check_travel(current, work_point(*point, origin)?)?
     }
+    if let Some([x, y]) = job.park {
+        check_travel(current, work_point(Point { x, y }, origin)?)?
+    }
     Ok(())
 }
 pub(crate) fn canvas_job(job: &Job, origin: [f64; 2]) -> Result<Vec<String>, String> {
@@ -194,6 +197,13 @@ pub(crate) fn registered_job(
         .iter()
         .find(|s| s.len() >= 2)
         .ok_or("No drawable strokes")?[0];
+    transformed.park = match job.park {
+        Some([x, y]) => {
+            let work = registration.point(Point { x, y }, origin)?;
+            Some([work[0], work[1]])
+        }
+        None => None,
+    };
     let mut lines = crate::device::build_job(&transformed, [first.x, -first.y, 0.])?;
     lines.insert(3, "G54".into());
     Ok(lines)
@@ -213,6 +223,12 @@ pub(crate) fn check_registered_travel(
         check_travel(
             current,
             calibration.registration.point(*point, calibration.origin)?,
+        )?;
+    }
+    if let Some([x, y]) = job.park {
+        check_travel(
+            current,
+            calibration.registration.point(Point { x, y }, calibration.origin)?,
         )?;
     }
     Ok(())
@@ -249,7 +265,7 @@ mod tests {
         let measure = |p:[f64;2]| {let q=expected.point(Point{x:p[0],y:p[1]},origin).unwrap();[q[0],q[1],0.]};
         let solved = Registration::solve_three(origin,second,third,measure(second),measure(third)).unwrap();
         for (a,b) in solved.matrix.unwrap().iter().zip(expected.matrix.unwrap()) { assert!((a-b).abs()<1e-10); }
-        let job=Job{document:Document{name:"affine".into(),width_mm:210.,height_mm:297.,strokes:vec![vec![Point{x:30.,y:50.},Point{x:40.,y:70.}]]},feed:1200.,travel_feed:1500.,z_feed:300.,z_down:4.};
+        let job=Job{document:Document{name:"affine".into(),width_mm:210.,height_mm:297.,strokes:vec![vec![Point{x:30.,y:50.},Point{x:40.,y:70.}]]},feed:1200.,travel_feed:1500.,z_feed:300.,z_down:4.,park: None};
         let target=solved.point(job.document.strokes[0][1],origin).unwrap();
         let lines=registered_job(&job,origin,solved).unwrap();
         assert!(lines.contains(&format!("G1 X{:.3} Y{:.3} F1200",target[0],target[1])));
@@ -281,6 +297,35 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn registered_job_maps_park_point_with_the_same_registration() {
+        let job = Job {
+            document: Document {
+                name: "park".into(),
+                width_mm: 210.,
+                height_mm: 297.,
+                strokes: vec![vec![Point { x: 30., y: 40. }, Point { x: 40., y: 50. }]],
+            },
+            feed: 1200.,
+            travel_feed: 1500.,
+            z_feed: 300.,
+            z_down: 4.,
+            park: Some([30., 40.]),
+        };
+        let registration = Registration {
+            scale: 1.2,
+            rotation_deg: 90.,
+            matrix: None,
+        };
+        let lines = registered_job(&job, [20., 30.], registration).unwrap();
+        let expected = registration
+            .point(Point { x: 30., y: 40. }, [20., 30.])
+            .unwrap();
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("G1 X{:.3} Y{:.3} F1500", expected[0], expected[1])
+        );
+    }
+    #[test]
     fn registered_job_uses_same_rotated_scaled_fixed_origin_as_move_to() {
         let job = Job {
             document: Document {
@@ -293,6 +338,7 @@ mod tests {
             travel_feed: 1500.,
             z_feed: 300.,
             z_down: 4.,
+            park: None,
         };
         let registration = Registration {
             scale: 1.2,
@@ -330,6 +376,7 @@ mod tests {
             travel_feed: 1500.,
             z_feed: 300.,
             z_down: 4.,
+            park: None,
         };
         let lines = canvas_job(&job, [10., 100.]).unwrap();
         assert!(lines.iter().any(|s| s == "G1 X30.000 Y30.000 F1500"));
@@ -356,6 +403,7 @@ mod tests {
             travel_feed: 1500.,
             z_feed: 300.,
             z_down: 4.,
+            park: None,
         };
         let lines = canvas_job(&job, [210., 0.]).unwrap();
         assert!(lines.iter().any(|s| s == "G1 X-180.000 Y-268.000 F1200"));

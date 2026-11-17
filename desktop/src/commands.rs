@@ -71,14 +71,19 @@ impl Backend {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Scan,
-    AutoConnect { #[serde(default)] swap_xy: bool },
+    AutoConnect {
+        #[serde(default)] swap_xy: bool,
+        #[serde(default)] flip_y: bool,
+    },
     Connect {
         port: String,
         #[serde(default)] swap_xy: bool,
+        #[serde(default)] flip_y: bool,
     },
     Recover {
         port: String,
         #[serde(default)] swap_xy: bool,
+        #[serde(default)] flip_y: bool,
     },
     Disconnect,
     Jog {
@@ -128,9 +133,9 @@ pub enum Request {
 pub fn device_command(command: Request, state: tauri::State<Backend>) -> Result<(), String> {
     let c = match command {
         Request::Scan => DeviceCommand::Scan,
-        Request::AutoConnect { swap_xy } => DeviceCommand::AutoConnect { swap_xy },
-        Request::Connect { port, swap_xy } => DeviceCommand::Connect { port, swap_xy },
-        Request::Recover { port, swap_xy } => DeviceCommand::Recover { port, swap_xy },
+        Request::AutoConnect { swap_xy, flip_y } => DeviceCommand::AutoConnect { swap_xy, flip_y },
+        Request::Connect { port, swap_xy, flip_y } => DeviceCommand::Connect { port, swap_xy, flip_y },
+        Request::Recover { port, swap_xy, flip_y } => DeviceCommand::Recover { port, swap_xy, flip_y },
         Request::Disconnect => DeviceCommand::Disconnect,
         Request::Jog { x, y, feed } => DeviceCommand::Jog { x, y, feed },
         Request::Calibrate {
@@ -553,8 +558,17 @@ pub fn generate_gcode(
     origin: Option<[f64; 2]>,
     registration: Option<crate::positioning::Registration>,
     swap_xy: Option<bool>,
+    flip_y: Option<bool>,
 ) -> Result<String, String> {
-    let wire_code = |lines: Vec<String>| lines.iter().map(|line| device::map_xy_axes(line, swap_xy.unwrap_or(false))).collect::<Vec<_>>().join("\n");
+    let invert_y = flip_y.unwrap_or_else(device::y_axis_inverted);
+    let wire_code = |lines: Vec<String>| {
+        lines
+            .iter()
+            .map(|line| device::map_xy_axes(line, swap_xy.unwrap_or(false)))
+            .map(|line| if invert_y { device::map_y_invert(&line) } else { line })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     if let Some(origin) = origin {
         if relative {
             return Err("Canvas positioning uses absolute G54 coordinates, not relative first-point placement".into());
@@ -567,6 +581,9 @@ pub fn generate_gcode(
         return Ok(format!("; Fixed canvas placement: G54 origin at canvas X{:.3} Y{:.3} mm\n; Registration {mapping}\n; Requires the same confirmed calibration and raised Z0 before execution\n{}\n", origin[0], origin[1], wire_code(lines)));
     }
     if registration.is_some() { return Err("Registration requires a confirmed canvas origin".into()); }
+    // Park coordinates arrive as canvas millimetres; strokes in this anchor-0
+    // preview use Y = -canvas_y, so the park point must follow the same rule.
+    let job = Job { park: job.park.map(|[x, y]| [x, -y]), ..job };
     let lines = if relative {
         device::build_relative_job(&job)?
     } else {
@@ -580,8 +597,8 @@ pub fn generate_gcode(
     Ok(format!("; {label}\n{}\n", wire_code(lines)))
 }
 #[tauri::command(rename_all = "snake_case")]
-pub fn export_gcode(path: String, job: Job, origin: Option<[f64; 2]>, registration: Option<crate::positioning::Registration>, swap_xy: Option<bool>) -> Result<(), String> {
-    std::fs::write(path, generate_gcode(job, origin.is_none(), origin, registration, swap_xy)?).map_err(|e| e.to_string())
+pub fn export_gcode(path: String, job: Job, origin: Option<[f64; 2]>, registration: Option<crate::positioning::Registration>, swap_xy: Option<bool>, flip_y: Option<bool>) -> Result<(), String> {
+    std::fs::write(path, generate_gcode(job, origin.is_none(), origin, registration, swap_xy, flip_y)?).map_err(|e| e.to_string())
 }
 #[tauri::command(rename_all = "snake_case")]
 pub fn export_document(path: String, document: Document, format: String) -> Result<(), String> {
@@ -764,6 +781,27 @@ mod tests {
     }
 
     #[test]
+    fn preview_maps_park_point_into_the_same_anchor_space_as_strokes() {
+        let job = Job {
+            document: Document {
+                name: "park-preview".into(),
+                width_mm: 100.,
+                height_mm: 100.,
+                strokes: vec![vec![
+                    crate::model::Point { x: 20., y: 30. },
+                    crate::model::Point { x: 22., y: 35. },
+                ]],
+            },
+            feed: 1200.,
+            travel_feed: 1500.,
+            z_feed: 300.,
+            z_down: 4.,
+            park: Some([3., 4.]),
+        };
+        let code = generate_gcode(job, false, None, None, None, None).unwrap();
+        assert!(code.contains("G1 X3.000 Y-4.000 F1500"), "{code}");
+    }
+    #[test]
     fn canvas_gcode_preserves_paper_placement_and_does_not_reanchor_first_point() {
         let job = Job {
             document: Document {
@@ -779,24 +817,25 @@ mod tests {
             travel_feed: 1500.,
             z_feed: 300.,
             z_down: 4.,
+            park: None,
         };
-        let code = generate_gcode(job.clone(), false, Some([10., 10.]), None, None).unwrap();
+        let code = generate_gcode(job.clone(), false, Some([10., 10.]), None, None, None).unwrap();
         assert!(code.contains("G54"));
         assert!(code.contains("X10.000 Y-20.000"));
         assert!(code.contains("X12.000 Y-25.000"));
         assert!(!code.contains("G10"));
         assert!(!code.contains("$H"));
-        let swapped = generate_gcode(job.clone(), false, Some([10.,10.]), None, Some(true)).unwrap();
+        let swapped = generate_gcode(job.clone(), false, Some([10.,10.]), None, Some(true), None).unwrap();
         assert!(swapped.contains("G1 Y10.000 X-20.000 F1500"));
         assert!(swapped.contains("G1 Y12.000 X-25.000 F1200"));
         assert!(swapped.contains("G1 G90 Z4.000 F300"));
-        let relative = generate_gcode(job.clone(), true, None, None, Some(true)).unwrap();
+        let relative = generate_gcode(job.clone(), true, None, None, Some(true), None).unwrap();
         assert!(relative.contains("G1 G91 Y2.000 X-5.000 F1200"));
         let path = std::env::temp_dir().join(format!("openink-axis-export-{}.gcode", std::process::id()));
-        export_gcode(path.to_string_lossy().into_owned(), job.clone(), Some([10.,10.]), None, Some(true)).unwrap();
+        export_gcode(path.to_string_lossy().into_owned(), job.clone(), Some([10.,10.]), None, Some(true), None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), swapped);
         std::fs::remove_file(path).unwrap();
-        assert!(generate_gcode(job, true, Some([10., 10.]), None, None).is_err());
+        assert!(generate_gcode(job, true, Some([10., 10.]), None, None, None).is_err());
     }
     #[test]
     fn connection_mapping_is_optional_but_strictly_boolean() {

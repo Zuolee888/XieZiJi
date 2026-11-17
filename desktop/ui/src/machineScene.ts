@@ -31,8 +31,9 @@ export function machineScene(width: number, height: number, degrees: number) {
         next.mapping = [sx*c*c+sy*s*s,(sy-sx)*c*s,(sy-sx)*c*s,sx*s*s+sy*c*c];
       }
       if (value.type === "run") {
-        const job = value.job as {document: {strokes: Point[][]}};
-        next.job = { ...job, document: document(job.document) };
+        const job = value.job as {document: {strokes: Point[][]}; park?: [number, number] | null};
+        const park = Array.isArray(job.park) ? point({ x: job.park[0], y: job.park[1] }) : null;
+        next.job = { ...job, document: document(job.document), park: park ? [park.x, park.y] : null };
       }
       return next;
     },

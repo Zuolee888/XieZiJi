@@ -390,6 +390,7 @@ mod tests {
             travel_feed: 2500.,
             z_feed: 300.,
             z_down: 4.,
+            park: None,
         }
     }
     #[test]
@@ -548,6 +549,7 @@ mod tests {
                     travel_feed: 2500.,
                     z_feed: 3000.,
                     z_down: 4.,
+                    park: None,
                 },
                 None,
                 reverse,
@@ -625,6 +627,7 @@ mod tests {
                         travel_feed: 2500.,
                         z_feed: 3000.,
                         z_down: 4.,
+                        park: None,
                     },
                     None,
                     true,

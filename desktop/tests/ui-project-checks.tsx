@@ -48,6 +48,7 @@ export async function projectChecks(){
   assert.deepEqual(paths(),['22,33 44,55']);
   await click('设备控制');
   assert.equal((document.querySelector('input[aria-label="第1点X"]') as HTMLInputElement).value,'210');
+  assert.equal((document.querySelector('input[aria-label="第1点Y"]') as HTMLInputElement).value,'0');
   assert.equal(document.body.textContent?.includes('工程已打开，请重新进行纸面校准'),false);
   assert.equal((document.querySelector('select[aria-label="校准方式"]') as HTMLSelectElement).value,'two');
   for(const [label,v] of [['描线速率',1234],['移动速度',2345],['Z速率',456],['落笔下探',5]])assert.equal((document.querySelector(`input[aria-label="${label}"]`) as HTMLInputElement).value,String(v));

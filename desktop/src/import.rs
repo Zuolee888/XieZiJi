@@ -996,6 +996,7 @@ mod tests {
                 travel_feed: 1500.,
                 z_feed: 300.,
                 z_down: 4.,
+                park: None,
             };
             let commands = crate::positioning::canvas_job(&job, [0., 0.]).unwrap();
             assert!(commands.len() > 100);
