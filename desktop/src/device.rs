@@ -799,10 +799,13 @@ fn open_link(name: &str, swap_xy: bool) -> Result<Link, String> {
         // "Busy" and "absent" share one error code, so the port's continued
         // presence is what separates them. Asking the enumerator here costs a
         // sweep only on the failure path, and it is the only locale-proof
-        // signal available.
+        // signal available. A failed sweep is reported as neither: it is
+        // passed through as `None` so the user is not told their port vanished
+        // when the check itself broke.
         .map_err(|e| {
             let still_listed = serialport::available_ports()
-                .is_ok_and(|ports| ports.iter().any(|p| p.port_name == name));
+                .ok()
+                .map(|ports| ports.iter().any(|p| p.port_name == name));
             match crate::bluetooth::describe_open_error(&e.kind(), still_listed) {
                 Some(message) => message.to_string(),
                 None => e.to_string(),
@@ -1352,16 +1355,6 @@ where
     }
 }
 
-/// Reconnects a dead Bluetooth session with spaced, re-binding attempts.
-///
-/// A dropped SPP link does not come back by reopening the same port name: the
-/// open fails in about 1 ms with `NotFound` because Windows removed the
-/// binding, and the fix is to re-enable the service and take whatever port
-/// Windows publishes afterwards. That is slow — 1.0–1.1 s cold, 1.65 s worst
-/// after 150 s idle — so the two back-to-back attempts the USB path uses are
-/// guaranteed to fail here. Each round therefore waits first
-/// (`reconnect_delay`), rebuilds the binding, and only then opens and
-/// handshakes.
 /// Why a Bluetooth recovery stopped.
 ///
 /// A user-initiated Stop is not a failure: reporting it as one would tell the
@@ -1373,6 +1366,16 @@ enum BluetoothRecovery {
     Failed(String),
 }
 
+/// Reconnects a dead Bluetooth session with spaced, re-binding attempts.
+///
+/// A dropped SPP link does not come back by reopening the same port name: the
+/// open fails in about 1 ms with `NotFound` because Windows removed the
+/// binding, and the fix is to re-enable the service and take whatever port
+/// Windows publishes afterwards. That is slow — 1.0–1.1 s cold, 1.65 s worst
+/// after 150 s idle — so the two back-to-back attempts the USB path uses are
+/// guaranteed to fail here. Each round therefore waits first
+/// (`reconnect_delay`), rebuilds the binding, and only then opens and
+/// handshakes.
 fn recover_bluetooth_link(
     mac: &str,
     swap_xy: bool,

@@ -194,7 +194,7 @@ pub fn reconnect_delay(attempt: u8) -> Option<std::time::Duration> {
     }
 }
 
-/// Translates the only two `open` failures a user can act on, or `None`.
+/// Translates the only failures a user can act on, or `None`.
 ///
 /// Windows COM ports open exclusively (`CreateFile` without sharing), so a
 /// second process opening the same port is refused — that *is* the
@@ -212,14 +212,25 @@ pub fn reconnect_delay(attempt: u8) -> Option<std::time::Duration> {
 /// would silently give a busy port the "rescan" advice on any Windows that
 /// does not speak Chinese or English.
 ///
+/// `None` means the caller could not find out: the enumeration itself failed.
+/// That must not be reported as absence — telling the user their port vanished
+/// would send them to rescan for a port that may still be there — so it gets
+/// its own neutral wording instead of borrowing either verdict.
+///
 /// Anything else (a timeout, an unsupported baud rate, a driver hand-back) has
 /// no better wording than the OS text, so it is left to the caller.
-pub fn describe_open_error(kind: &serialport::ErrorKind, still_listed: bool) -> Option<&'static str> {
-    match kind {
-        serialport::ErrorKind::NoDevice if still_listed => {
+pub fn describe_open_error(
+    kind: &serialport::ErrorKind,
+    still_listed: Option<bool>,
+) -> Option<&'static str> {
+    match (kind, still_listed) {
+        (serialport::ErrorKind::NoDevice, Some(true)) => {
             Some("端口被其它程序占用，请关闭占用该端口的程序后重试")
         }
-        serialport::ErrorKind::NoDevice => Some("端口已消失，请重新扫描设备列表"),
+        (serialport::ErrorKind::NoDevice, Some(false)) => Some("端口已消失，请重新扫描设备列表"),
+        (serialport::ErrorKind::NoDevice, None) => {
+            Some("端口无法打开，请重新扫描设备列表后重试")
+        }
         _ => None,
     }
 }
@@ -912,14 +923,21 @@ mod tests {
         // A port that is still enumerated but refuses to open is held by
         // another process; one that vanished from the enumeration is absent.
         // Presence, not wording, is the signal - the OS text is localised.
-        assert!(describe_open_error(&ErrorKind::NoDevice, true)
+        assert!(describe_open_error(&ErrorKind::NoDevice, Some(true))
             .unwrap()
             .contains("被其它程序占用"));
-        assert!(describe_open_error(&ErrorKind::NoDevice, false)
+        assert!(describe_open_error(&ErrorKind::NoDevice, Some(false))
             .unwrap()
             .contains("端口已消失"));
-        assert!(describe_open_error(&ErrorKind::Io(std::io::ErrorKind::TimedOut), true).is_none());
-        assert!(describe_open_error(&ErrorKind::InvalidInput, false).is_none());
+        // The sweep itself failed, so neither verdict is known. Saying
+        // "vanished" here would send the user to rescan for a port that may
+        // well still be present and merely unopenable.
+        let unknown = describe_open_error(&ErrorKind::NoDevice, None).unwrap();
+        assert!(unknown.contains("无法打开"), "{unknown}");
+        assert!(!unknown.contains("已消失"), "{unknown}");
+        assert!(describe_open_error(&ErrorKind::Io(std::io::ErrorKind::TimedOut), Some(true))
+            .is_none());
+        assert!(describe_open_error(&ErrorKind::InvalidInput, None).is_none());
     }
 
     #[test]
