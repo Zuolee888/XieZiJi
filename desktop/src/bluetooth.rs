@@ -202,28 +202,24 @@ pub fn reconnect_delay(attempt: u8) -> Option<std::time::Duration> {
 /// naming. A remembered-but-absent port is refused the same way, in ~1 ms,
 /// because the device slept or Windows dropped the SPP binding.
 ///
-/// Both refusals arrive as one code, so the two cases have to be told apart by
-/// hand: `serialport` maps `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND` and
-/// `ERROR_ACCESS_DENIED` onto the single `ErrorKind::NoDevice`
-/// (`serialport-4.10.1/src/windows/error.rs:16`), and `io::ErrorKind` therefore
-/// only ever sees `NotFound` for either. What still differs is the OS message
-/// text, so `description` is consulted — the access-denied wording wins, and
-/// anything that is not recognisably a sharing violation is reported as the
-/// absent port, which is the far more common cause and whose repair ("rescan")
-/// also re-discovers a port that a held-by-another-process refusal would hide.
+/// Both refusals arrive as one code: `serialport` maps
+/// `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND` and `ERROR_ACCESS_DENIED`
+/// onto the single `ErrorKind::NoDevice`
+/// (`serialport-4.10.1/src/windows/error.rs:17`), and `io::ErrorKind` then
+/// only ever sees `NotFound` for either. The two cases are therefore told
+/// apart by *whether the port still exists* — the caller passes that in as
+/// `still_listed` — and never by the OS message text, which is localised and
+/// would silently give a busy port the "rescan" advice on any Windows that
+/// does not speak Chinese or English.
 ///
 /// Anything else (a timeout, an unsupported baud rate, a driver hand-back) has
 /// no better wording than the OS text, so it is left to the caller.
-pub fn describe_open_error(kind: &serialport::ErrorKind, description: &str) -> Option<&'static str> {
+pub fn describe_open_error(kind: &serialport::ErrorKind, still_listed: bool) -> Option<&'static str> {
     match kind {
-        serialport::ErrorKind::NoDevice => {
-            let text = description.to_ascii_lowercase();
-            if description.contains("拒绝") || text.contains("denied") || text.contains("in use") {
-                Some("端口被其它程序占用，请关闭占用该端口的程序后重试")
-            } else {
-                Some("端口已消失，请重新扫描设备列表")
-            }
+        serialport::ErrorKind::NoDevice if still_listed => {
+            Some("端口被其它程序占用，请关闭占用该端口的程序后重试")
         }
+        serialport::ErrorKind::NoDevice => Some("端口已消失，请重新扫描设备列表"),
         _ => None,
     }
 }
@@ -913,20 +909,17 @@ mod tests {
     #[test]
     fn open_failures_explain_themselves_in_chinese() {
         use serialport::ErrorKind;
-        // The two measured wordings on this machine: a port another process
-        // holds, and a remembered port Windows no longer publishes.
-        assert!(describe_open_error(&ErrorKind::NoDevice, "系统找不到指定的文件。")
+        // A port that is still enumerated but refuses to open is held by
+        // another process; one that vanished from the enumeration is absent.
+        // Presence, not wording, is the signal - the OS text is localised.
+        assert!(describe_open_error(&ErrorKind::NoDevice, true)
+            .unwrap()
+            .contains("被其它程序占用"));
+        assert!(describe_open_error(&ErrorKind::NoDevice, false)
             .unwrap()
             .contains("端口已消失"));
-        assert!(describe_open_error(&ErrorKind::NoDevice, "拒绝访问。")
-            .unwrap()
-            .contains("被其它程序占用"));
-        // Windows itself, in case the OS locale is English.
-        assert!(describe_open_error(&ErrorKind::NoDevice, "Access is denied.")
-            .unwrap()
-            .contains("被其它程序占用"));
-        assert!(describe_open_error(&ErrorKind::Io(std::io::ErrorKind::TimedOut), "timed out")
-            .is_none());
+        assert!(describe_open_error(&ErrorKind::Io(std::io::ErrorKind::TimedOut), true).is_none());
+        assert!(describe_open_error(&ErrorKind::InvalidInput, false).is_none());
     }
 
     #[test]

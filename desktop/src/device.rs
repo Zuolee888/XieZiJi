@@ -795,9 +795,18 @@ fn open_link(name: &str, swap_xy: bool) -> Result<Link, String> {
         // them ("系统找不到指定的文件。") says nothing about a COM port. Every
         // other error keeps the OS wording, which is more specific than
         // anything this layer could invent.
-        .map_err(|e| match crate::bluetooth::describe_open_error(&e.kind(), &e.description) {
-            Some(message) => message.to_string(),
-            None => e.to_string(),
+        //
+        // "Busy" and "absent" share one error code, so the port's continued
+        // presence is what separates them. Asking the enumerator here costs a
+        // sweep only on the failure path, and it is the only locale-proof
+        // signal available.
+        .map_err(|e| {
+            let still_listed = serialport::available_ports()
+                .is_ok_and(|ports| ports.iter().any(|p| p.port_name == name));
+            match crate::bluetooth::describe_open_error(&e.kind(), still_listed) {
+                Some(message) => message.to_string(),
+                None => e.to_string(),
+            }
         })?;
     port.write_data_terminal_ready(true)
         .map_err(|e| e.to_string())?;
@@ -1353,31 +1362,65 @@ where
 /// guaranteed to fail here. Each round therefore waits first
 /// (`reconnect_delay`), rebuilds the binding, and only then opens and
 /// handshakes.
+/// Why a Bluetooth recovery stopped.
+///
+/// A user-initiated Stop is not a failure: reporting it as one would tell the
+/// user their deliberate cancel was five failed attempts. The distinction has
+/// to travel out of the loop, so it is a value rather than a `String`.
+enum BluetoothRecovery {
+    Reconnected(String, Link, Status),
+    Stopped,
+    Failed(String),
+}
+
 fn recover_bluetooth_link(
     mac: &str,
     swap_xy: bool,
     physical_reference: &mut Option<f64>,
     recovery: &RecoveryGate,
-) -> Result<(String, Link, Status), String> {
+    events: &Sender<DeviceEvent>,
+) -> BluetoothRecovery {
     let mut last = "Serial session lost".to_string();
     for attempt in 0.. {
         let Some(delay) = crate::bluetooth::reconnect_delay(attempt) else {
             break;
         };
-        thread::sleep(delay);
-        // A Stop that arrives while this thread sleeps is honoured after the
-        // loop by `discard_recovery_commands`, exactly as on the USB path; the
-        // flag is read here only so a stop already recorded cannot be waited
-        // out for another attempt.
+        // Slept in slices so a Stop is honoured within ~200 ms instead of
+        // waiting out up to 4 s. A full failure run costs ~85 s, and the only
+        // exits during it are Stop and Disconnect.
+        wait_in_slices(delay, &recovery.stop_requested);
         if recovery.stop_requested.load(Ordering::SeqCst) {
-            return Err("Recovery was stopped before the link came back".into());
+            return BluetoothRecovery::Stopped;
         }
         match reconnect_bluetooth_once(mac, swap_xy, physical_reference) {
-            Ok(pair) => return Ok(pair),
-            Err(reason) => last = reason,
+            Ok((port, l, s)) => return BluetoothRecovery::Reconnected(port, l, s),
+            Err(reason) => {
+                // Without this the app looks frozen for a minute and a half:
+                // `Recovering(true)` is the only other signal, and it never
+                // changes between attempts.
+                let _ = events.send(DeviceEvent::Log(format!(
+                    "蓝牙重连第 {}/5 次失败：{reason}",
+                    attempt + 1
+                )));
+                last = reason;
+            }
         }
     }
-    Err(last)
+    BluetoothRecovery::Failed(last)
+}
+
+/// Sleeps `total` in 200 ms slices, returning early once `stop` is set.
+fn wait_in_slices(total: Duration, stop: &AtomicBool) {
+    let slice = Duration::from_millis(200);
+    let mut slept = Duration::ZERO;
+    while slept < total {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let step = slice.min(total - slept);
+        thread::sleep(step);
+        slept += step;
+    }
 }
 
 /// One spaced attempt: re-enable the SPP service, wait for the port Windows
@@ -2981,12 +3024,17 @@ fn worker_loop(
                     _ => None,
                 };
                 if let Some(mac) = bluetooth_mac {
-                    let result =
-                        recover_bluetooth_link(&mac, swap_xy, &mut physical_reference, &recovery);
+                    let result = recover_bluetooth_link(
+                        &mac,
+                        swap_xy,
+                        &mut physical_reference,
+                        &recovery,
+                        &events,
+                    );
                     let queued = discard_recovery_commands(&commands);
                     if !queued.disconnect {
                         match result {
-                            Ok((port, l, s)) => {
+                            BluetoothRecovery::Reconnected(port, l, s) => {
                                 link = Some(l);
                                 connected_port = Some(port.clone());
                                 // Same peer, so the identity that drove this
@@ -3000,7 +3048,12 @@ fn worker_loop(
                                 emit(DeviceEvent::Status(s));
                                 emit(DeviceEvent::Stopped);
                             }
-                            Err(reason) => emit(DeviceEvent::Error(format!(
+                            // Reporting a deliberate cancel as five failed
+                            // attempts would misdescribe what the user just
+                            // did, so this is a stop, not an error. The
+                            // stop flag is cleared once, below.
+                            BluetoothRecovery::Stopped => emit(DeviceEvent::Stopped),
+                            BluetoothRecovery::Failed(reason) => emit(DeviceEvent::Error(format!(
                                 "Automatic recovery failed after five bounded attempts: {reason}"
                             ))),
                         }
@@ -6424,5 +6477,23 @@ mod tests {
             }
             BtPortError::Failed(message) => panic!("expected a retryable reason, got {message}"),
         }
+    }
+
+    #[test]
+    fn waiting_aborts_within_a_slice_when_stop_arrives() {
+        // A full Bluetooth recovery run takes about 85 s and Stop is the only
+        // way out of it. Sleeping one whole delay would leave the key dead for
+        // up to the 4 s cap, so the wait is sliced and re-checks the flag.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let setter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        wait_in_slices(Duration::from_secs(4), &stop);
+        let waited = start.elapsed();
+        setter.join().unwrap();
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
     }
 }
