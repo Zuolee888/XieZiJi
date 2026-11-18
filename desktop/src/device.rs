@@ -1504,9 +1504,19 @@ fn worker_loop(
                                 });
                             // A second failure reports the original error:
                             // whatever the first probe saw is the diagnosis.
+                            // The rebind's own error still goes to the log,
+                            // because "we rebuilt the port and Windows never
+                            // re-published it" and "we never rebuilt anything"
+                            // are otherwise indistinguishable in the field.
                             match rebind.map(|mac| rebind_once(&mac, swap_xy)) {
                                 Some(Ok(opened)) => Ok(opened),
-                                Some(Err(_)) | None => Err(e),
+                                Some(Err(rebind_error)) => {
+                                    emit(DeviceEvent::Log(format!(
+                                        "SPP rebind failed: {rebind_error}"
+                                    )));
+                                    Err(e)
+                                }
+                                None => Err(e),
                             }
                         }
                     };
@@ -1591,8 +1601,20 @@ fn worker_loop(
                                         &e,
                                     ) {
                                         // A second failure reports the original
-                                        // error: the first probe is the diagnosis.
-                                        rebind_once(&mac, swap_xy).map_err(|_| e)
+                                        // error: the first probe is the
+                                        // diagnosis. The rebind's own error
+                                        // goes to the log so a silent no-op
+                                        // stays distinguishable from a port
+                                        // that Windows never re-published.
+                                        match rebind_once(&mac, swap_xy) {
+                                            Ok(opened) => Ok(opened),
+                                            Err(rebind_error) => {
+                                                emit(DeviceEvent::Log(format!(
+                                                    "SPP rebind failed: {rebind_error}"
+                                                )));
+                                                Err(e)
+                                            }
+                                        }
                                     } else {
                                         Err(e)
                                     }

@@ -158,6 +158,13 @@ pub fn choose_port_for_mac<'a>(ports: &'a [SppPort], mac: Mac) -> Option<&'a Spp
 /// rebinding would re-read the same bytes and hide the original diagnosis
 /// under a second, less specific error. `device.rs`'s stale-ACK message says so
 /// outright: "Inspect any queued controller commands before reconnecting".
+///
+/// The `recover_session` refusals are excluded for the same reason. They are
+/// not "Recovery " prefixes in general: "Recovery could not confirm stationary
+/// Hold:0/Idle" is the dead-link signature this function exists to repair, and
+/// it fires before the handshake ever runs. Only the two that report a machine
+/// which answered and declined — an ALARM, or a state that cannot be reset
+/// from — must stay unretried.
 pub fn should_rebind_spp(kind: PortKind, attempt: u8, error: &str) -> bool {
     kind == PortKind::Bluetooth
         && attempt == 0
@@ -165,6 +172,8 @@ pub fn should_rebind_spp(kind: PortKind, attempt: u8, error: &str) -> bool {
         && !error.contains("Extra ACK")
         && !error.contains("Unexpected stale ACK")
         && !error.contains("GRBL rejected")
+        && !error.contains("Recovery refused")
+        && !error.contains("Recovery cannot reset")
 }
 
 /// A discovered (or remembered) Bluetooth device.
@@ -715,6 +724,22 @@ mod tests {
         assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "GRBL rejected the read-only connection query: error:9"));
         // Stale bytes mean someone must inspect the queue; retrying only hides the diagnosis.
         assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "Unexpected stale ACK before identity query; no $I, reset, unlock or resume was sent"));
+        // recover_session reports its own refusals before the handshake runs. The
+        // controller answered and declined, so a new port would change nothing.
+        assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "Recovery refused while controller reports ALARM:1; no unlock or reset was sent"));
+        assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "Recovery cannot reset controller in Door:0; wait for a stationary state and inspect the machine"));
+    }
+
+    #[test]
+    fn rebind_still_retries_the_message_that_actually_means_a_dead_link() {
+        // "Recovery " must not become a blanket exclusion: this one is emitted
+        // when the port opened but produced no usable status, which is exactly
+        // the case a rebuilt SPP port fixes.
+        assert!(should_rebind_spp(
+            PortKind::Bluetooth,
+            0,
+            "Recovery could not confirm stationary Hold:0/Idle (last state: unknown); no reset was sent"
+        ));
     }
 
     #[test]
