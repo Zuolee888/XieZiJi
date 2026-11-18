@@ -225,6 +225,7 @@ fn map_event(e: DeviceEvent) -> Value {
             json!({"type":"origin_mode","automatic":automatic})
         }
         DeviceEvent::Connected(port) => json!({"type":"connected","port":port}),
+        DeviceEvent::LinkWarning(message) => json!({"type":"link_warning","message":message}),
         DeviceEvent::Disconnected => json!({"type":"disconnected"}),
         DeviceEvent::Status(status) => json!({"type":"status","status":status}),
         DeviceEvent::Log(message) => json!({"type":"log","message":message}),

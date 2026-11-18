@@ -197,6 +197,9 @@ pub enum DeviceEvent {
         reason: String,
     },
     Connected(String),
+    /// Both a USB and a Bluetooth link are live at once. Sent once per newly
+    /// established connection, never on recovery.
+    LinkWarning(String),
     Disconnected,
     Status(Status),
     Log(String),
@@ -798,7 +801,7 @@ fn open_link(name: &str, swap_xy: bool) -> Result<Link, String> {
         rx: vec![], swap_xy,
     })
 }
-fn connect(name: &str, swap_xy: bool) -> Result<(Link, Status), String> {
+fn connect(name: &str, swap_xy: bool) -> Result<(Link, Status, Vec<String>), String> {
     let l = open_link(name, swap_xy)?;
     // Recovery starts with realtime status only, so a retained Hold cannot
     // swallow an identity query. Never resume the abandoned planner queue.
@@ -986,7 +989,7 @@ fn verify_registration_origin(
     // Point 1 already defines XY0; finishing must not rebase or move the tip.
     Ok(confirmed.clone())
 }
-fn handshake(mut l: Link, timeout: Duration) -> Result<(Link, Status), String> {
+fn handshake(mut l: Link, timeout: Duration) -> Result<(Link, Status, Vec<String>), String> {
     // 2026-10-25 read-only hardware evidence: in Hold:0 this firmware still
     // answers realtime '?' but retains ordinary '$I\n' bytes in RX without
     // processing/ACKing them. Never add ordinary lines to a held controller.
@@ -1032,7 +1035,12 @@ fn handshake(mut l: Link, timeout: Duration) -> Result<(Link, Status), String> {
                 identity = false;
                 end = Instant::now() + timeout;
             } else if identity && ack {
-                return Ok((l, status.unwrap()));
+                // The identity reply is the only place the firmware tells us
+                // whether a second (Bluetooth) link is live. Hand it out with
+                // the link so callers never have to ask again: appending a
+                // fresh `$I` to a held controller is exactly what this
+                // handshake exists to avoid.
+                return Ok((l, status.unwrap(), observations));
             }
         }
     }
@@ -1216,7 +1224,10 @@ fn recover_session_impl(
             // Everything before this new startup epoch (including old ACKs and
             // old status reports) is abandoned. The handshake asks afresh.
             l.rx.clear();
-            let (mut l, mut status) = handshake(l, timeout)
+            // Recovery runs on a link that was already broken, so its identity
+            // reply is discarded: warning here would fire on every automatic
+            // recovery and drown out the one the user needs on a fresh connect.
+            let (mut l, mut status, _) = handshake(l, timeout)
                 .map_err(|e| format!("Controller restarted but recovery handshake failed: {e}"))?;
             lift_to_machine_z(&mut l, &mut status, raised, None)?;
             // A reset may change work offsets: establish raised Z only after
@@ -1342,9 +1353,42 @@ fn rebind_once(mac: &str, swap_xy: bool) -> Result<(String, Link, Status), Strin
             return Err(reason)
         }
     };
-    let (link, status) = connect(&name, swap_xy)?;
+    // A rebound port is always an SPP port we just opened ourselves, so the
+    // firmware cannot report a second peer holding the link: no warning is
+    // possible, and the tuple stays as small as its callers expect.
+    let (link, status, _) = connect(&name, swap_xy)?;
     Ok((name, link, status))
 }
+/// Link kind of a bare port name, decided after the connect already succeeded.
+///
+/// Only a name is in hand here, so SPP membership is the sole evidence: a port
+/// that has a registry row is Bluetooth, anything else is treated as USB.
+/// `spp_ports()` reads the registry only and turns any failure into an empty
+/// list, so a broken enumeration degrades to `Usb` and the warning is skipped
+/// rather than blocking the connection. That ordering is the whole point: Task 7
+/// promised that a manual USB connect pays for no enumeration, and that a broken
+/// enumeration can never refuse a port that actually opens. Running this only
+/// after the port opened keeps both promises — a slow or failing registry sweep
+/// can no longer influence whether the connection succeeds.
+fn kind_after_connect(name: &str) -> PortKind {
+    if crate::bluetooth::spp_ports()
+        .iter()
+        .any(|p| p.port_name == name)
+    {
+        PortKind::Bluetooth
+    } else {
+        PortKind::Usb
+    }
+}
+
+/// Emits the both-links-live warning, if the identity reply warrants one.
+fn emit_link_warning(events: &Sender<DeviceEvent>, kind: PortKind, observations: &[String]) {
+    let mode = crate::bluetooth::parse_link_mode(observations);
+    if let Some(message) = crate::bluetooth::link_warning(kind, &mode) {
+        let _ = events.send(DeviceEvent::LinkWarning(message));
+    }
+}
+
 fn accept_ack(pending: &mut Option<Instant>) -> Result<(), String> {
     pending
         .take()
@@ -1484,7 +1528,7 @@ fn worker_loop(
                     swap_xy = requested;
                     set_flip_y(invert_y);
                     let opened = match connect(&name, swap_xy) {
-                        Ok((l, s)) => Ok((name.clone(), l, s)),
+                        Ok((l, s, observations)) => Ok((name.clone(), l, s, observations)),
                         Err(e) => {
                             // Only enumerate on the failure path. Enumerating up
                             // front would add a serial + registry sweep to every
@@ -1509,7 +1553,9 @@ fn worker_loop(
                             // re-published it" and "we never rebuilt anything"
                             // are otherwise indistinguishable in the field.
                             match rebind.map(|mac| rebind_once(&mac, swap_xy)) {
-                                Some(Ok(opened)) => Ok(opened),
+                                // A rebound port is Bluetooth, so no peer can
+                                // hold it; empty observations say so.
+                                Some(Ok((port, l, s))) => Ok((port, l, s, vec![])),
                                 Some(Err(rebind_error)) => {
                                     emit(DeviceEvent::Log(format!(
                                         "SPP rebind failed: {rebind_error}"
@@ -1521,7 +1567,7 @@ fn worker_loop(
                         }
                     };
                     match opened {
-                    Ok((port, l, s)) => {
+                    Ok((port, l, s, observations)) => {
                         link = Some(l);
                         connected_port = Some(port.clone());
                         last_received = Instant::now();
@@ -1532,8 +1578,18 @@ fn worker_loop(
                         explicit_origin = false;
                         emit(DeviceEvent::AutoOrigin(true));
                         emit(DeviceEvent::CalibrationChanged { origin: None });
-                        emit(DeviceEvent::Connected(port));
+                        emit(DeviceEvent::Connected(port.clone()));
                         emit(DeviceEvent::Status(s));
+                        // After the connection itself, so a panel that only
+                        // reacts while connected cannot drop the warning.
+                        // Only now, with the link already open, is the kind
+                        // worth the registry read: it cannot refuse or delay
+                        // anything that would otherwise work.
+                        emit_link_warning(
+                            &events,
+                            kind_after_connect(&port),
+                            &observations,
+                        );
                     }
                     Err(e) => emit(DeviceEvent::Error(e)),
                     }
@@ -1545,8 +1601,11 @@ fn worker_loop(
                     Ok(p) => match auto_select_candidate(&p) {
                         Ok(candidate) => {
                             let name = &candidate.name;
+                            // The chosen port already carries its kind, so this
+                            // arm never needs another enumeration.
+                            let kind = candidate.kind;
                             match connect(name, swap_xy) {
-                                Ok((l, s)) => {
+                                Ok((l, s, observations)) => {
                                     link = Some(l);
                                     connected_port = Some(name.clone());
                                     last_received = Instant::now();
@@ -1558,7 +1617,11 @@ fn worker_loop(
                                     emit(DeviceEvent::AutoOrigin(true));
                                     emit(DeviceEvent::CalibrationChanged { origin: None });
                                     emit(DeviceEvent::Connected(name.clone()));
-                                    emit(DeviceEvent::Status(s))
+                                    emit(DeviceEvent::Status(s));
+                                    // After the connection itself, so a panel
+                                    // that only reacts while connected cannot
+                                    // drop the warning.
+                                    emit_link_warning(&events, kind, &observations);
                                 }
                                 Err(e) => emit(DeviceEvent::Error(e)),
                             }
@@ -1590,7 +1653,12 @@ fn worker_loop(
                         Err(BtPortError::Failed(message)) => emit(DeviceEvent::Error(message)),
                         Ok(name) => {
                             let opened = match connect(&name, swap_xy) {
-                                Ok((l, s)) => Ok((name, l, s)),
+                                // This arm opened the SPP port itself, so the
+                                // kind is definitively Bluetooth and a peer
+                                // cannot be holding it: the observations are
+                                // dropped rather than parsed for a warning that
+                                // `link_warning` could never produce.
+                                Ok((l, s, _)) => Ok((name, l, s)),
                                 Err(e) => {
                                     // The MAC is already in hand on this path,
                                     // so no enumeration is needed to know that a
@@ -3023,6 +3091,56 @@ mod tests {
         assert_eq!(*output.lock().unwrap(), b"G21\n");
     }
     #[test]
+    fn multi_line_identity_survives_a_split_read() {
+        // The wire delivers $I's reply in two chunks — the exact shape that makes a
+        // single read() return half a line on this hardware.
+        use std::sync::Mutex;
+        struct ChunkWire {
+            chunks: Vec<Vec<u8>>,
+            sent: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Read for ChunkWire {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.chunks.is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "t"));
+                }
+                let chunk = self.chunks.remove(0);
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                Ok(n)
+            }
+        }
+        impl Write for ChunkWire {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.sent.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut link = Link {
+            port: Box::new(ChunkWire {
+                chunks: vec![
+                    b"[VER:1.3a.20221114:]\r\n[OPT:MPHB]\r\n[MSG:Mode=BT:Name=BtWri".to_vec(),
+                    b"ter(70:4B:CA:72:AC:A2):Status=Connected with 4C:23:38:0C:97:4C]\r\nok\r\n".to_vec(),
+                ],
+                sent: sent.clone(),
+            }),
+            rx: vec![],
+            swap_xy: false,
+        };
+        let mut lines = vec![];
+        while lines.last().map(String::as_str) != Some("ok") {
+            lines.extend(link.lines().unwrap());
+        }
+        assert_eq!(
+            crate::bluetooth::parse_link_mode(&lines),
+            crate::bluetooth::LinkMode::BluetoothConnected("4C:23:38:0C:97:4C".into())
+        );
+    }
+    #[test]
     fn paused_ack_deadline_is_suspended() {
         let start = Instant::now();
         let now = start + Duration::from_secs(60);
@@ -3891,7 +4009,7 @@ mod tests {
             }),
             rx: vec![], swap_xy: false,
         };
-        let result = handshake(link, Duration::from_millis(30)).map(|(_, status)| status);
+        let result = handshake(link, Duration::from_millis(30)).map(|(_, status, _)| status);
         let output = writes.lock().unwrap().clone();
         (result, output)
     }

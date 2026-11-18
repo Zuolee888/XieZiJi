@@ -176,6 +176,70 @@ pub fn should_rebind_spp(kind: PortKind, attempt: u8, error: &str) -> bool {
         && !error.contains("Recovery cannot reset")
 }
 
+/// What the controller's own `$I` reply says about its Bluetooth link.
+///
+/// The firmware prints one `[MSG:Mode=BT:...]` line in its identity output. When
+/// a phone or a PC holds the SPP link the line carries `Status=Connected with
+/// <peer MAC>`, so a USB connection can see that a second link is live even
+/// though it only reads plain text.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkMode {
+    /// Some peer MAC holds the Bluetooth link.
+    BluetoothConnected(String),
+    /// The Bluetooth radio is up but no peer is connected.
+    BluetoothIdle,
+    /// The firmware did not report the mode line at all.
+    Unknown,
+}
+
+/// Reads the `[MSG:Mode=BT:...]` line GRBL_ESP32 prints in its `$I` reply.
+///
+/// Only whole lines are considered: a `[MSG:` line is matched from its start, so
+/// ordinary text that merely mentions the mode cannot be mistaken for it. The
+/// peer MAC is kept exactly as printed — the caller compares it, so normalising
+/// case here would hide a real mismatch.
+pub fn parse_link_mode(lines: &[String]) -> LinkMode {
+    for line in lines {
+        let Some(rest) = line.strip_prefix("[MSG:Mode=BT:") else {
+            continue;
+        };
+        if let Some(rest) = rest.strip_prefix("Name=") {
+            // Name=<...>:Status=<...>] — the status follows the last colon
+            // before the closing bracket, and the name itself may hold colons
+            // (it carries the local MAC in parentheses).
+            let Some((_, status)) = rest.rsplit_once(":Status=") else {
+                continue;
+            };
+            let status = status.strip_suffix(']').unwrap_or(status);
+            if let Some(peer) = status.strip_prefix("Connected with ") {
+                return LinkMode::BluetoothConnected(peer.to_string());
+            }
+            if status == "Not connected" {
+                return LinkMode::BluetoothIdle;
+            }
+            return LinkMode::Unknown;
+        }
+    }
+    LinkMode::Unknown
+}
+
+/// The warning to show when a link we opened is not the only live one.
+///
+/// A USB connection whose controller already holds a Bluetooth peer means both
+/// links can deliver G-code, and interleaved motion is a ruined drawing. The
+/// reverse is impossible: a Bluetooth link we opened is the only link the
+/// firmware can report as connected, so no warning is ever needed there.
+pub fn link_warning(kind: PortKind, mode: &LinkMode) -> Option<String> {
+    if kind == PortKind::Usb && matches!(mode, LinkMode::BluetoothConnected(_)) {
+        Some(
+            "机械同时被蓝牙链路占用，两条链路同时下发指令会让动作交错。请关闭其中一条连接后再开始书写"
+                .into(),
+        )
+    } else {
+        None
+    }
+}
+
 /// A discovered (or remembered) Bluetooth device.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BtDevice {
@@ -740,6 +804,37 @@ mod tests {
             0,
             "Recovery could not confirm stationary Hold:0/Idle (last state: unknown); no reset was sent"
         ));
+    }
+
+    #[test]
+    fn parses_bluetooth_link_state_from_real_identity_output() {
+        let bt = vec![
+            "[VER:1.3a.20221114:]".to_string(),
+            "[OPT:MPHB]".to_string(),
+            "[MSG:Mode=BT:Name=BtWriter(70:4B:CA:72:AC:A2):Status=Connected with 4C:23:38:0C:97:4C]".to_string(),
+            "ok".to_string(),
+        ];
+        assert_eq!(parse_link_mode(&bt), LinkMode::BluetoothConnected("4C:23:38:0C:97:4C".into()));
+
+        let usb = vec![
+            "[VER:1.3a.20221114:]".to_string(),
+            "[OPT:MPHB]".to_string(),
+            "[MSG:Mode=BT:Name=BtWriter(70:4B:CA:72:AC:A2):Status=Not connected]".to_string(),
+            "ok".to_string(),
+        ];
+        assert_eq!(parse_link_mode(&usb), LinkMode::BluetoothIdle);
+
+        assert_eq!(parse_link_mode(&["ok".to_string()]), LinkMode::Unknown);
+        assert_eq!(parse_link_mode(&[]), LinkMode::Unknown);
+    }
+
+    #[test]
+    fn warns_only_when_bluetooth_holds_the_link_we_did_not_open() {
+        let peer = LinkMode::BluetoothConnected("4C:23:38:0C:97:4C".into());
+        assert!(link_warning(PortKind::Usb, &peer).is_some());
+        assert!(link_warning(PortKind::Bluetooth, &peer).is_none());
+        assert!(link_warning(PortKind::Usb, &LinkMode::BluetoothIdle).is_none());
+        assert!(link_warning(PortKind::Usb, &LinkMode::Unknown).is_none());
     }
 
     #[test]
