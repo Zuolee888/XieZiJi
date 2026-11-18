@@ -19,6 +19,7 @@ import Toggle from "./Toggle";
 import RegistrationHandles from "./RegistrationHandles";
 import { RegistrationPanel, type RegistrationProfile, type RegistrationSetup } from "./RegistrationPanel";
 import { machineScene } from "./machineScene";
+import { deviceLabel, portLabel, silentReconnectTarget } from "./btPanelModel";
 import { identityRegistration, registrationMatrix, registrationScales, scaledRegistration, type Registration } from "./coordinateGeometry";
 import { ensureStrokeIds, unwrittenDocument, completedStrokeIds, resetWrittenSelection, markCompletedStroke } from "./writtenTracking";
 import { DraftNumberInput } from "./DraftNumberInput";
@@ -51,6 +52,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  BluetoothSearching,
   BookOpen,
   Check,
   ChevronDown,
@@ -116,7 +118,19 @@ type Template = {
   letter_spacing_mm: number;
   lines: number;
 };
-type Port = { name: string; description: string; preferred: boolean };
+type Port = {
+  name: string;
+  description: string;
+  preferred: boolean;
+  kind?: "usb" | "bluetooth" | "other";
+  mac?: string | null;
+};
+type BtDevice = {
+  mac: string;
+  name: string;
+  remembered: boolean;
+  authenticated: boolean;
+};
 type GlyphFont = { name: string; path: string; characters: string[] };
 type ComparisonVariant = {
   label: string;
@@ -180,6 +194,8 @@ type Event = {
   scale?: number;
   rotation_deg?: number;
   matrix?: [number, number, number, number];
+  devices?: BtDevice[];
+  mac?: string;
 };
 const desktop = !!(window as unknown as Record<string, unknown>)
   .__TAURI_INTERNALS__;
@@ -568,6 +584,17 @@ export default function App() {
     [running, setRunning] = useState(false),
     [paused, setPaused] = useState(false),
     [progress, setProgress] = useState({ sent: 0, total: 0 });
+  const [btDevices, setBtDevices] = useState<BtDevice[]>([]);
+  // A sweep blocks the backend for several seconds, so the button stays disabled
+  // until the device list (or a failure) comes back.
+  const [btScanning, setBtScanning] = useState(false);
+  // The last machine we connected to over Bluetooth, remembered by MAC because a
+  // COM name changes with every pairing. Read once; written after a successful
+  // Bluetooth connect.
+  const [rememberedMac, setRememberedMac] = useState(() => {
+    try { return window.localStorage.getItem("openink-bt-mac") ?? ""; }
+    catch { return ""; }
+  });
   const [feed, setFeed] = useState(4500),
     [travelFeed, setTravelFeed] = useState(3500),
     [zFeed, setZFeed] = useState(4500),
@@ -634,6 +661,32 @@ export default function App() {
   }
   const machineBusy = jobLocked || running || positioning || recovering;
   const connectionAttempt = useRef(false);
+  // The poll loop is started once, so anything it reads about the current link
+  // has to be mirrored into a ref instead of a captured state value.
+  const connectedRef = useRef(connected);
+  connectedRef.current = connected;
+  const portsRef = useRef(ports);
+  portsRef.current = ports;
+  const autoConnectRef = useRef(autoConnect);
+  autoConnectRef.current = autoConnect;
+  const rememberedMacRef = useRef(rememberedMac);
+  rememberedMacRef.current = rememberedMac;
+  const swapXYRef = useRef(swapXY);
+  swapXYRef.current = swapXY;
+  const flipYRef = useRef(flipY);
+  flipYRef.current = flipY;
+  // The silent reconnect is allowed exactly once per launch: a machine that is
+  // out of range must not be retried every time the port list changes.
+  const reconnectTried = useRef(false);
+  // True while the launch-time reconnect is in flight. Its failure belongs in the
+  // status line only — a red message at every start reads as a fault.
+  const silentReconnect = useRef(false);
+  // The `connected` event reports only the port name, so the MAC is parked here
+  // when the user asks for a Bluetooth link and stored once that link is up.
+  const pendingBtMac = useRef<string | null>(null);
+  // 「改用 USB 连接」 has to disconnect first (the backend refuses a second link)
+  // and finish the switch when the disconnect lands.
+  const pendingUsbSwitch = useRef(false);
   const [viewRotation, setViewRotation] = useState(0);
   const paperAngleRef = useRef(viewRotation);
   paperAngleRef.current = viewRotation;
@@ -808,6 +861,41 @@ export default function App() {
     if (!(await command(request))) { setPositioning(false); return false; }
     return true;
   }
+  async function scanBluetooth() {
+    if (btScanning || machineBusy) return;
+    setBtScanning(true);
+    if (!(await command({ type: "bt_scan" }))) setBtScanning(false);
+  }
+  async function connectBluetooth(mac: string) {
+    if (connecting || connected || machineBusy) return;
+    // Park the MAC before asking: the `connected` event reports only the port
+    // name, so this is the only chance to learn which machine was chosen.
+    pendingBtMac.current = mac;
+    const ok = await command({ type: "bt_connect", mac, swap_xy: swapXY, flip_y: flipY });
+    if (!ok) pendingBtMac.current = null;
+  }
+  async function forgetBluetooth(mac: string) {
+    if (btScanning || machineBusy) return;
+    // The backend re-runs the sweep after forgetting, so the list refreshes on
+    // its own and the button stays disabled until it does.
+    setBtScanning(true);
+    if (!(await command({ type: "bt_forget", mac }))) setBtScanning(false);
+  }
+  async function switchToUsb() {
+    if (!connected || machineBusy) return;
+    if (!portsRef.current.some((p) => p.kind === "usb")) {
+      notify("没有找到 USB 串口，请用数据线连接机器后重新扫描。", true);
+      return;
+    }
+    // The backend refuses a second link, so the switch waits for the disconnect
+    // to land; the `disconnected` event finishes it.
+    pendingUsbSwitch.current = true;
+    const ok = await command({ type: "disconnect" });
+    if (!ok) {
+      pendingUsbSwitch.current = false;
+      notify("断开蓝牙链路失败，请重试后再改用 USB 连接。", true);
+    }
+  }
   function selectAlignmentPoint(point: { x: number; y: number }) {
     setRegistrationPointEdit({ index: 0, point: [point.x, point.y] });
     setSelectingAlignmentPoint(false); setCanvasTool("select");
@@ -824,6 +912,9 @@ export default function App() {
   const wcoKnown =
     status.wco?.length === 3 && status.wco.every((v) => Number.isFinite(v));
   const canJog = !!connected && !machineBusy && status.state === "Idle";
+  // Which physical link the machine is on right now. The port list carries the
+  // kind, so no extra backend call is needed.
+  const connectedKind = ports.find((p) => p.name === connected)?.kind;
   useJogKeys(rightOpen && rightTab === "machine" && canJog && !busy && !inkFontOpen, jogStep, travelFeed, command);
   const canPen =
     canJog &&
@@ -1251,10 +1342,28 @@ export default function App() {
             case "origin_mode":
               setAutomaticOrigin(e.automatic !== false && paperAngleRef.current === 0);
               break;
-            case "ports":
-              setPorts(e.ports || []);
-              setPort((p) => p || e.ports?.[0]?.name || "");
+            case "ports": {
+              const nextPorts = e.ports || [];
+              setPorts(nextPorts);
+              setPort((p) => p || nextPorts[0]?.name || "");
+              // One silent attempt per launch. A machine that is out of range must
+              // not raise the recovery card or a dialog on every start; the status
+              // line alone says the Bluetooth link did not come up.
+              if (!reconnectTried.current) {
+                reconnectTried.current = true;
+                const target = silentReconnectTarget(rememberedMacRef.current || null, nextPorts);
+                if (target && !connectedRef.current && autoConnectRef.current) {
+                  silentReconnect.current = true;
+                  void call("device_command", {
+                    command: { type: "connect", port: target, swap_xy: swapXYRef.current, flip_y: flipYRef.current },
+                  }).catch(() => {
+                    silentReconnect.current = false;
+                    setStatus({ state: "蓝牙未连接" });
+                  });
+                }
+              }
               break;
+            }
             case "connected":
               setRegistration(preservedRegistrationRef.current || identityRegistration); setRegistrationLocked(false); setSessionVersion(v => v + 1);
               setMachineOriginReady(false);
@@ -1264,6 +1373,16 @@ export default function App() {
               connectionAttempt.current = false;
               setConnecting(false);
               setConnectionError(false);
+              setBtScanning(false);
+              silentReconnect.current = false;
+              if (pendingBtMac.current) {
+                // Remember the machine, not the COM name: Windows hands out a new
+                // one after every pairing, so only the MAC survives a reboot.
+                setRememberedMac(pendingBtMac.current);
+                try { window.localStorage.setItem("openink-bt-mac", pendingBtMac.current); }
+                catch { /* storage is optional; the link still works without memory */ }
+                pendingBtMac.current = null;
+              }
               setConnected(e.port || "");
               notify(`已连接 ${e.port}`);
               break;
@@ -1271,6 +1390,7 @@ export default function App() {
               recordInterruptedBatch();
               setConnecting(false);
               connectionAttempt.current = false;
+              silentReconnect.current = false;
               setRegistration(preservedRegistrationRef.current || identityRegistration); setRegistrationLocked(false); setSessionVersion(v => v + 1);
               submittedStrokes.current = null;
               submittedOrderedIds.current = [];
@@ -1281,6 +1401,14 @@ export default function App() {
               setConfirmedOrigin(null); setRegistration(preservedRegistrationRef.current || identityRegistration);
               if (projectCalibrationRef.current || currentLayoutRef.current.scale_x !== undefined) { setAutomaticOrigin(false); setProjectNeedsAlignment(true); }
               setStatus({ state: "未连接" });
+              // The link is gone by the time this event arrives, so the backend
+              // accepts the follow-up connect the USB switch needs.
+              if (pendingUsbSwitch.current) {
+                pendingUsbSwitch.current = false;
+                const usb = portsRef.current.find((p) => p.kind === "usb");
+                if (usb) void command({ type: "connect", port: usb.name });
+                else notify("没有找到 USB 串口，请用数据线连接机器后重新扫描。", true);
+              }
               break;
             case "status":
               if (e.status) setStatus(e.status);
@@ -1373,8 +1501,31 @@ export default function App() {
                 setSessionVersion(v => v + 1);
               }
               break;
+            case "bt_devices":
+              setBtDevices(e.devices || []);
+              setBtScanning(false);
+              break;
+            case "bt_error":
+              setBtScanning(false);
+              notify(e.message || "蓝牙链接没有建立，请确认机器已开机并靠近电脑后重试", true);
+              break;
+            case "link_warning":
+              setBtScanning(false);
+              notify(e.message || "机器同时被另一条链路占用，请关闭其中一条连接后再开始书写", true);
+              break;
             case "error":
               setRegistrationErrorVersion(v => v + 1);
+              // A failed sweep comes back as a plain error, not `bt_error`, so the
+              // scan button is re-enabled here as well.
+              setBtScanning(false);
+              if (silentReconnect.current) {
+                // The launch-time attempt is allowed to fail quietly: the status
+                // line says 蓝牙未连接 and nothing else. A red notice on every
+                // start would be read as a fault.
+                silentReconnect.current = false;
+                setStatus({ state: "蓝牙未连接" });
+                break;
+              }
               if (connectionAttempt.current) { setConnectionError(true); setConnecting(false); connectionAttempt.current = false; }
               notify(e.message || "设备错误", true);
               break;
@@ -3247,8 +3398,7 @@ export default function App() {
                       <option value="">选择设备串口</option>
                       {ports.map((p) => (
                         <option key={p.name} value={p.name}>
-                          {p.name}
-                          {p.preferred ? " · CH340" : ""} {p.description}
+                          {portLabel(p)}
                         </option>
                       ))}
                     </select>
@@ -3275,6 +3425,77 @@ export default function App() {
                     {connected ? <Unplug size={15} /> : <Power size={15} />}{" "}
                     {connected ? "断开连接" : "连接设备"}
                   </button>
+                  <div className="material-list" aria-label="蓝牙设备">
+                    <div className="material-item">
+                      <span>
+                        蓝牙机器
+                        <small>
+                          {btScanning
+                            ? "正在扫描附近的蓝牙机器，请稍候"
+                            : btDevices.length
+                              ? "点「连接」即可建立蓝牙链路，未配对的机器会在连接时自动完成配对"
+                              : "点右侧按钮扫描，就近查找已开启蓝牙的机器"}
+                        </small>
+                      </span>
+                      <button
+                        className="icon-button bordered"
+                        title="扫描蓝牙设备"
+                        disabled={btScanning || machineBusy || !!connected}
+                        onClick={() => void scanBluetooth()}
+                      >
+                        {btScanning ? (
+                          <LoaderCircle className="spin" size={15} />
+                        ) : (
+                          <BluetoothSearching size={15} />
+                        )}
+                      </button>
+                    </div>
+                    {btDevices.map((d) => (
+                      <div className="material-item" key={d.mac}>
+                        <span>
+                          {deviceLabel(d)}
+                          <small>{d.mac}</small>
+                        </span>
+                        <span style={{ display: "flex", gap: 6 }}>
+                          <button
+                            className="button small"
+                            disabled={connecting || btScanning || machineBusy || !!connected}
+                            onClick={() => void connectBluetooth(d.mac)}
+                          >
+                            连接
+                          </button>
+                          <button
+                            className="button small"
+                            disabled={!d.remembered || btScanning || machineBusy || !!connected}
+                            onClick={() => void forgetBluetooth(d.mac)}
+                          >
+                            忘记
+                          </button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="field-note">
+                    蓝牙链路只在点按时建立；「已记忆，未认证」表示系统只记住了地址，任何程序都能连上这台机器，请不要把蓝牙当作安全边界。
+                  </p>
+                  {connected && (
+                    <p className="field-note">
+                      {connectedKind === "bluetooth"
+                        ? `当前通过蓝牙连接 ${connected}。`
+                        : connectedKind === "usb"
+                          ? `当前通过 USB 连接 ${connected}。`
+                          : `当前连接 ${connected}。`}
+                    </p>
+                  )}
+                  {connected && connectedKind === "bluetooth" && (
+                    <button
+                      className="button full"
+                      disabled={machineBusy}
+                      onClick={() => void switchToUsb()}
+                    >
+                      <Usb size={15} /> 改用 USB 连接
+                    </button>
+                  )}
                   {(recovering || connectionError || (!connected && jobLocked)) && (
                     <div className="recover-card">
                       <button
