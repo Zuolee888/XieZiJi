@@ -791,7 +791,14 @@ fn open_link(name: &str, swap_xy: bool) -> Result<Link, String> {
         .flow_control(serialport::FlowControl::None)
         .timeout(Duration::from_millis(30))
         .open()
-        .map_err(|e| e.to_string())?;
+        // Two failures have a repair the user can perform, and the OS text for
+        // them ("系统找不到指定的文件。") says nothing about a COM port. Every
+        // other error keeps the OS wording, which is more specific than
+        // anything this layer could invent.
+        .map_err(|e| match crate::bluetooth::describe_open_error(&e.kind(), &e.description) {
+            Some(message) => message.to_string(),
+            None => e.to_string(),
+        })?;
     port.write_data_terminal_ready(true)
         .map_err(|e| e.to_string())?;
     port.write_request_to_send(true)
@@ -1336,6 +1343,73 @@ where
     }
 }
 
+/// Reconnects a dead Bluetooth session with spaced, re-binding attempts.
+///
+/// A dropped SPP link does not come back by reopening the same port name: the
+/// open fails in about 1 ms with `NotFound` because Windows removed the
+/// binding, and the fix is to re-enable the service and take whatever port
+/// Windows publishes afterwards. That is slow — 1.0–1.1 s cold, 1.65 s worst
+/// after 150 s idle — so the two back-to-back attempts the USB path uses are
+/// guaranteed to fail here. Each round therefore waits first
+/// (`reconnect_delay`), rebuilds the binding, and only then opens and
+/// handshakes.
+fn recover_bluetooth_link(
+    mac: &str,
+    swap_xy: bool,
+    physical_reference: &mut Option<f64>,
+    recovery: &RecoveryGate,
+) -> Result<(String, Link, Status), String> {
+    let mut last = "Serial session lost".to_string();
+    for attempt in 0.. {
+        let Some(delay) = crate::bluetooth::reconnect_delay(attempt) else {
+            break;
+        };
+        thread::sleep(delay);
+        // A Stop that arrives while this thread sleeps is honoured after the
+        // loop by `discard_recovery_commands`, exactly as on the USB path; the
+        // flag is read here only so a stop already recorded cannot be waited
+        // out for another attempt.
+        if recovery.stop_requested.load(Ordering::SeqCst) {
+            return Err("Recovery was stopped before the link came back".into());
+        }
+        match reconnect_bluetooth_once(mac, swap_xy, physical_reference) {
+            Ok(pair) => return Ok(pair),
+            Err(reason) => last = reason,
+        }
+    }
+    Err(last)
+}
+
+/// One spaced attempt: re-enable the SPP service, wait for the port Windows
+/// publishes for `mac`, then open it and recover the session.
+///
+/// The port name comes back with the link because Windows can publish a
+/// different name for the same device, and reporting the old one would leave
+/// the UI naming a port that no longer exists.
+fn reconnect_bluetooth_once(
+    mac: &str,
+    swap_xy: bool,
+    physical_reference: &mut Option<f64>,
+) -> Result<(String, Link, Status), String> {
+    let address = crate::bluetooth::Mac::parse(mac)
+        .ok_or_else(|| format!("MAC address {mac} cannot be parsed"))?;
+    let backend = crate::bluetooth::backend();
+    // Re-enabling is the whole point of the round: the binding is what got
+    // dropped, so the next `spp_ports` read must follow a fresh request.
+    backend
+        .ensure_spp(address)
+        .map_err(|e| format!("SPP service could not be enabled: {e}"))?;
+    let name = poll_for_port(|| backend.spp_ports(), address, Duration::from_secs(2)).map_err(
+        |e| match e {
+            BtPortError::NotReady(reason) | BtPortError::Failed(reason) => reason,
+        },
+    )?;
+    let l = open_link(&name, swap_xy)?;
+    let (l, s) =
+        recover_session_with_reference(l, Duration::from_secs(3), false, false, physical_reference)?;
+    Ok((name, l, s))
+}
+
 /// Rebuilds the SPP binding for `mac` and connects to the port it produces.
 ///
 /// This deliberately goes through `connect` rather than hand-writing
@@ -1359,7 +1433,7 @@ fn rebind_once(mac: &str, swap_xy: bool) -> Result<(String, Link, Status), Strin
     let (link, status, _) = connect(&name, swap_xy)?;
     Ok((name, link, status))
 }
-/// Link kind of a bare port name, decided after the connect already succeeded.
+/// The port's kind *and* peer MAC, decided after the connect already succeeded.
 ///
 /// Only a name is in hand here, so SPP membership is the sole evidence.
 ///
@@ -1376,11 +1450,16 @@ fn rebind_once(mac: &str, swap_xy: bool) -> Result<(String, Link, Status), Strin
 /// that a manual USB connect pays for no enumeration, and that a broken
 /// enumeration can never refuse a port that actually opens. A slow or failing
 /// sweep here can no longer influence whether the connection succeeds.
-fn kind_after_connect(name: &str) -> PortKind {
+///
+/// The peer MAC comes from the same read because the reconnect path needs it to
+/// re-enable the SPP service, which takes the address as text.
+fn link_identity_after_connect(name: &str) -> (PortKind, Option<String>) {
     match crate::bluetooth::try_spp_ports() {
-        Ok(ports) if ports.iter().any(|p| p.port_name == name) => PortKind::Bluetooth,
-        Ok(_) => PortKind::Usb,
-        Err(_) => PortKind::Other,
+        Ok(ports) => match ports.into_iter().find(|p| p.port_name == name) {
+            Some(port) => (PortKind::Bluetooth, Some(port.mac.to_string())),
+            None => (PortKind::Usb, None),
+        },
+        Err(_) => (PortKind::Other, None),
     }
 }
 
@@ -1493,6 +1572,11 @@ fn worker_loop(
     let mut swap_xy = initial.as_ref().is_some_and(|(link, _)| link.swap_xy);
     let mut link: Option<Link> = None;
     let mut connected_port: Option<String> = initial_port;
+    // What kind of link `connected_port` names, and for Bluetooth which peer.
+    // Kept alongside the port name because a fault clears the name before the
+    // reconnect decision is made, and re-deriving it there would cost a
+    // registry read while the link is already gone.
+    let mut connected_link: Option<(PortKind, Option<String>)> = None;
     let mut calibration = initial_calibration;
     let mut registration_pending = false;
     let mut registration_second: Option<([f64;2],[f64;3])> = None;
@@ -1604,11 +1688,9 @@ fn worker_loop(
                         // Only now, with the link already open, is the kind
                         // worth the registry read: it cannot refuse or delay
                         // anything that would otherwise work.
-                        emit_link_warning(
-                            &events,
-                            kind_after_connect(&port),
-                            &observations,
-                        );
+                        let (kind, peer) = link_identity_after_connect(&port);
+                        emit_link_warning(&events, kind, &observations);
+                        connected_link = Some((kind, peer));
                     }
                     Err(e) => emit(DeviceEvent::Error(e)),
                     }
@@ -1620,9 +1702,10 @@ fn worker_loop(
                     Ok(p) => match auto_select_candidate(&p) {
                         Ok(candidate) => {
                             let name = &candidate.name;
-                            // The chosen port already carries its kind, so this
-                            // arm never needs another enumeration.
+                            // The chosen port already carries its kind and peer,
+                            // so this arm never needs another enumeration.
                             let kind = candidate.kind;
+                            let peer = candidate.mac.clone();
                             match connect(name, swap_xy) {
                                 Ok((l, s, observations)) => {
                                     link = Some(l);
@@ -1640,6 +1723,7 @@ fn worker_loop(
                                     // After the connection itself, so a panel
                                     // that only reacts while connected cannot
                                     // drop the warning.
+                                    connected_link = Some((kind, peer));
                                     emit_link_warning(&events, kind, &observations);
                                 }
                                 Err(e) => emit(DeviceEvent::Error(e)),
@@ -1726,6 +1810,10 @@ fn worker_loop(
                                 emit(DeviceEvent::CalibrationChanged { origin: None });
                                 emit(DeviceEvent::Connected(name));
                                 emit(DeviceEvent::Status(s));
+                                // The MAC is already in hand here, so the
+                                // identity needs no enumeration at all — and
+                                // the peer is what a later reconnect needs.
+                                connected_link = Some((PortKind::Bluetooth, Some(mac.clone())));
                                 // No warning is possible on this path, but a
                                 // controller that claims its Bluetooth link is
                                 // idle while we are talking over it is worth a
@@ -1751,6 +1839,7 @@ fn worker_loop(
                     }
                     link = None;
                     connected_port = None;
+                    connected_link = None;
                     queue.clear();
                     pending = None;
                     preflight = None;
@@ -1862,6 +1951,7 @@ fn worker_loop(
                                     Ok(()) => {}
                                     Err(e) => {
                                         connected_port = None;
+                                        connected_link = None;
                                         held_after_stop = true;
                                         emit(DeviceEvent::Error(e));
                                         emit(DeviceEvent::Disconnected);
@@ -1878,10 +1968,21 @@ fn worker_loop(
                             if queued.disconnect {
                                 link = None;
                                 connected_port = None;
+                                connected_link = None;
                                 emit(DeviceEvent::Disconnected)
                             } else {
+                                // Recovering to the port we were already on
+                                // keeps the identity we had; a different
+                                // target has to be asked about, and only then
+                                // is the registry read worth its cost.
+                                let identity = if connected_port == target {
+                                    connected_link
+                                } else {
+                                    target.as_deref().map(link_identity_after_connect)
+                                };
                                 link = Some(new_link);
                                 connected_port = target;
+                                connected_link = identity;
                                 if let Some(name) = connected_port.as_ref() {
                                     emit(DeviceEvent::Connected(name.clone()))
                                 }
@@ -1894,6 +1995,7 @@ fn worker_loop(
                         Err(reason) => {
                             link = None;
                             connected_port = None;
+                            connected_link = None;
                             held_after_stop = true;
                             emit(DeviceEvent::Error(format!(
                                 "Controller recovery failed: {reason}"
@@ -2830,6 +2932,11 @@ fn worker_loop(
         }
         if let Some(e) = fault {
             let retry_port = connected_port.clone().filter(|_| !paused);
+            // Captured before the clearing below, which is the only other thing
+            // that can still reach this identity. Reading `connected_link`
+            // after that point would always see `None` and silently turn the
+            // Bluetooth backoff into dead code.
+            let failed_identity = connected_link;
             // Preserve the session's physical raised plane before any reset or
             // reconnect can rebase WCO/Z. Never infer pen-up from reset Z0.
             let prior_reference = calibration
@@ -2842,6 +2949,7 @@ fn worker_loop(
             }
             let failed_link = link.take();
             connected_port = None;
+            connected_link = None;
             queue.clear();
             pending = None;
             preflight = None;
@@ -2863,6 +2971,45 @@ fn worker_loop(
                 recovery.active.store(true, Ordering::SeqCst);
                 emit(DeviceEvent::Recovering(true));
                 let mut physical_reference = prior_reference;
+                // A dropped SPP link cannot come back by reopening the same
+                // name: the binding itself is what Windows removed, so
+                // Bluetooth has to rebuild it, and rebuilding is slow enough
+                // that the attempts need spacing. Everything else keeps the
+                // immediate two-attempt path, where an attempt is cheap.
+                let bluetooth_mac = match &failed_identity {
+                    Some((PortKind::Bluetooth, Some(mac))) => Some(mac.clone()),
+                    _ => None,
+                };
+                if let Some(mac) = bluetooth_mac {
+                    let result =
+                        recover_bluetooth_link(&mac, swap_xy, &mut physical_reference, &recovery);
+                    let queued = discard_recovery_commands(&commands);
+                    if !queued.disconnect {
+                        match result {
+                            Ok((port, l, s)) => {
+                                link = Some(l);
+                                connected_port = Some(port.clone());
+                                // Same peer, so the identity that drove this
+                                // loop is still the truth about the link.
+                                connected_link = failed_identity;
+                                status = s.clone();
+                                held_after_stop = false;
+                                last_received = Instant::now();
+                                last_query = Instant::now();
+                                emit(DeviceEvent::Connected(port));
+                                emit(DeviceEvent::Status(s));
+                                emit(DeviceEvent::Stopped);
+                            }
+                            Err(reason) => emit(DeviceEvent::Error(format!(
+                                "Automatic recovery failed after five bounded attempts: {reason}"
+                            ))),
+                        }
+                    }
+                } else {
+                // The USB (and unknown-kind) path: unchanged, still two
+                // immediate attempts. An attempt here is a cheap reopen of a
+                // port whose name is still valid, so spacing would only delay
+                // a recovery that usually succeeds on the first try.
                 let attempt = failed_link
                     .ok_or_else(|| "Serial session lost".into())
                     .and_then(|l| {
@@ -2891,6 +3038,9 @@ fn worker_loop(
                         Ok((l, s)) => {
                             link = Some(l);
                             connected_port = Some(name.clone());
+                            // Same port, same peer: the identity survived the
+                            // reconnect untouched.
+                            connected_link = failed_identity;
                             status = s.clone();
                             held_after_stop = false;
                             last_received = Instant::now();
@@ -2903,6 +3053,7 @@ fn worker_loop(
                             "Automatic recovery failed after two bounded attempts: {reason}"
                         ))),
                     }
+                }
                 }
                 recovery.stop_requested.store(false, Ordering::SeqCst);
                 recovery.active.store(false, Ordering::SeqCst);

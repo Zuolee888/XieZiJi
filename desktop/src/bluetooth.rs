@@ -176,6 +176,58 @@ pub fn should_rebind_spp(kind: PortKind, attempt: u8, error: &str) -> bool {
         && !error.contains("Recovery cannot reset")
 }
 
+/// How long to wait before the next reconnect attempt, or `None` to give up.
+///
+/// A Bluetooth port that vanished needs a fresh SPP binding, which is slow: a
+/// cold open takes 1.0–1.1 s and 1.65 s at worst after 150 s idle, and a
+/// close+reopen that must re-bind the service is slower still. The USB path
+/// retries twice back to back because a USB failure is not a timing problem;
+/// Bluetooth is the opposite, so attempts are spaced and bounded: 1 s, 2 s,
+/// 4 s, 4 s, 4 s, then stop. Five attempts is the budget — long enough to ride
+/// out a device that slept, short enough that a device that is actually gone
+/// still ends in a diagnosis rather than an endless loop.
+pub fn reconnect_delay(attempt: u8) -> Option<std::time::Duration> {
+    if attempt < 5 {
+        Some(std::time::Duration::from_secs(1u64 << attempt.min(2)))
+    } else {
+        None
+    }
+}
+
+/// Translates the only two `open` failures a user can act on, or `None`.
+///
+/// Windows COM ports open exclusively (`CreateFile` without sharing), so a
+/// second process opening the same port is refused — that *is* the
+/// cross-process mutual exclusion the design asks for, and all it needs is
+/// naming. A remembered-but-absent port is refused the same way, in ~1 ms,
+/// because the device slept or Windows dropped the SPP binding.
+///
+/// Both refusals arrive as one code, so the two cases have to be told apart by
+/// hand: `serialport` maps `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND` and
+/// `ERROR_ACCESS_DENIED` onto the single `ErrorKind::NoDevice`
+/// (`serialport-4.10.1/src/windows/error.rs:16`), and `io::ErrorKind` therefore
+/// only ever sees `NotFound` for either. What still differs is the OS message
+/// text, so `description` is consulted — the access-denied wording wins, and
+/// anything that is not recognisably a sharing violation is reported as the
+/// absent port, which is the far more common cause and whose repair ("rescan")
+/// also re-discovers a port that a held-by-another-process refusal would hide.
+///
+/// Anything else (a timeout, an unsupported baud rate, a driver hand-back) has
+/// no better wording than the OS text, so it is left to the caller.
+pub fn describe_open_error(kind: &serialport::ErrorKind, description: &str) -> Option<&'static str> {
+    match kind {
+        serialport::ErrorKind::NoDevice => {
+            let text = description.to_ascii_lowercase();
+            if description.contains("拒绝") || text.contains("denied") || text.contains("in use") {
+                Some("端口被其它程序占用，请关闭占用该端口的程序后重试")
+            } else {
+                Some("端口已消失，请重新扫描设备列表")
+            }
+        }
+        _ => None,
+    }
+}
+
 /// What the controller's own `$I` reply says about its Bluetooth link.
 ///
 /// The firmware prints one `[MSG:Mode=BT:...]` line in its identity output. When
@@ -856,6 +908,36 @@ mod tests {
         // `Other` is what a failed SPP sweep produces. Warning there would tell a
         // user who is legitimately on Bluetooth that someone else holds the link.
         assert!(link_warning(PortKind::Other, &peer).is_none());
+    }
+
+    #[test]
+    fn open_failures_explain_themselves_in_chinese() {
+        use serialport::ErrorKind;
+        // The two measured wordings on this machine: a port another process
+        // holds, and a remembered port Windows no longer publishes.
+        assert!(describe_open_error(&ErrorKind::NoDevice, "系统找不到指定的文件。")
+            .unwrap()
+            .contains("端口已消失"));
+        assert!(describe_open_error(&ErrorKind::NoDevice, "拒绝访问。")
+            .unwrap()
+            .contains("被其它程序占用"));
+        // Windows itself, in case the OS locale is English.
+        assert!(describe_open_error(&ErrorKind::NoDevice, "Access is denied.")
+            .unwrap()
+            .contains("被其它程序占用"));
+        assert!(describe_open_error(&ErrorKind::Io(std::io::ErrorKind::TimedOut), "timed out")
+            .is_none());
+    }
+
+    #[test]
+    fn reconnect_backoff_is_capped_and_gives_up() {
+        use std::time::Duration;
+        assert_eq!(reconnect_delay(0), Some(Duration::from_secs(1)));
+        assert_eq!(reconnect_delay(1), Some(Duration::from_secs(2)));
+        assert_eq!(reconnect_delay(2), Some(Duration::from_secs(4)));
+        assert_eq!(reconnect_delay(3), Some(Duration::from_secs(4)));
+        assert_eq!(reconnect_delay(4), Some(Duration::from_secs(4)));
+        assert_eq!(reconnect_delay(5), None);
     }
 
     #[test]
