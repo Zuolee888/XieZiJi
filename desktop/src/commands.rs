@@ -213,6 +213,7 @@ pub fn poll_device(state: tauri::State<Backend>) -> Result<Vec<Value>, String> {
         .map(map_event)
         .collect())
 }
+
 fn map_event(e: DeviceEvent) -> Value {
     match e {
         DeviceEvent::Ports(ports) => json!({"type":"ports","ports":ports}),
@@ -251,6 +252,7 @@ fn map_event(e: DeviceEvent) -> Value {
         DeviceEvent::Paused(paused) => json!({"type":"paused","paused":paused}),
     }
 }
+
 #[tauri::command]
 pub fn default_import_options() -> ImportOptions {
     ImportOptions::default()
@@ -898,6 +900,18 @@ mod tests {
         }]));
         assert_eq!(v["type"], "bt_devices");
         assert_eq!(v["devices"][0]["name"], "BtWriter");
+    }
+    #[test]
+    fn bt_port_not_ready_event_becomes_a_retryable_message() {
+        // The panel keys its retry hint on "bt_error"; renaming this string would
+        // silently stop telling the user to tap connect again after a first pairing.
+        let v = map_event(DeviceEvent::BtPortNotReady {
+            mac: "70:4B:CA:72:AC:A2".into(),
+            reason: "系统还没有为该设备建立串口，请确认写字机已开机且未被手机占用".into(),
+        });
+        assert_eq!(v["type"], "bt_error");
+        assert_eq!(v["message"], "系统还没有为该设备建立串口，请确认写字机已开机且未被手机占用");
+        assert!(v.get("mac").is_none(), "the payload carries no mac; the panel retries from its list");
     }
     #[test]
     fn font_layout_jitter_preserves_paths_and_repeats_with_seed() {

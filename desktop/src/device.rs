@@ -190,7 +190,8 @@ pub enum DeviceEvent {
     /// an unpaired device has no COM port yet.
     BtDevices(Vec<crate::bluetooth::BtDevice>),
     /// Pairing succeeded but no SPP port carries the requested MAC yet. `mac`
-    /// is echoed so the UI can retry the same device without a rescan.
+    /// is kept for the retry path inside this module; the IPC payload only
+    /// carries `reason`, because the panel retries from its device list.
     BtPortNotReady {
         mac: String,
         reason: String,
