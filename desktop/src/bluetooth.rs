@@ -2,6 +2,7 @@
 //! turning Windows registry rows into SPP COM ports, and the Windows backend
 //! (bthprops + registry) that lists devices and creates SPP ports.
 
+use crate::device::PortKind;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -140,6 +141,30 @@ pub fn choose_port_for_mac<'a>(ports: &'a [SppPort], mac: Mac) -> Option<&'a Spp
         return None;
     }
     ports.iter().find(|port| port.mac == mac)
+}
+
+/// True when a failed connect is worth retrying on a freshly rebuilt SPP port.
+///
+/// Retrying the same COM name cannot help when the port itself is gone: the
+/// device slept, or Windows dropped the SPP binding. Rebuilding the binding
+/// yields a new port name, which is the only fix available without the user.
+///
+/// Only the first attempt is retried — two attempts is the budget — and only
+/// for Bluetooth, because a USB failure is never fixed by a new SPP port.
+///
+/// The excluded errors all describe a controller that answered but refused:
+/// a non-Idle state, a duplicate ACK, a rejected query, or bytes left over
+/// from an earlier session. Those need a human look at the machine, and
+/// rebinding would re-read the same bytes and hide the original diagnosis
+/// under a second, less specific error. `device.rs`'s stale-ACK message says so
+/// outright: "Inspect any queued controller commands before reconnecting".
+pub fn should_rebind_spp(kind: PortKind, attempt: u8, error: &str) -> bool {
+    kind == PortKind::Bluetooth
+        && attempt == 0
+        && !error.contains("Controller is ")
+        && !error.contains("Extra ACK")
+        && !error.contains("Unexpected stale ACK")
+        && !error.contains("GRBL rejected")
 }
 
 /// A discovered (or remembered) Bluetooth device.
@@ -672,6 +697,24 @@ mod tests {
         assert!(headset.authenticated);
         let fresh = bt_device_from("AA:BB:CC:DD:EE:FF", "X", 0, 0);
         assert!(!fresh.remembered && !fresh.authenticated);
+    }
+
+    #[test]
+    fn rebind_only_for_bluetooth_first_failure() {
+        let read_timeout = "Read-only GRBL handshake incomplete (missing: status)";
+        assert!(should_rebind_spp(PortKind::Bluetooth, 0, read_timeout));
+        assert!(!should_rebind_spp(PortKind::Bluetooth, 1, read_timeout));
+        assert!(!should_rebind_spp(PortKind::Usb, 0, read_timeout));
+    }
+
+    #[test]
+    fn rebind_skips_errors_a_new_port_cannot_fix() {
+        // A held/alarmed controller must never be retried by silently rebinding.
+        assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "Controller is Hold:0. Connection refused"));
+        assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "Extra ACK during handshake"));
+        assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "GRBL rejected the read-only connection query: error:9"));
+        // Stale bytes mean someone must inspect the queue; retrying only hides the diagnosis.
+        assert!(!should_rebind_spp(PortKind::Bluetooth, 0, "Unexpected stale ACK before identity query; no $I, reset, unlock or resume was sent"));
     }
 
     #[test]

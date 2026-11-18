@@ -1265,6 +1265,7 @@ fn scan_bluetooth(emit: &impl Fn(DeviceEvent)) {
 /// `NotReady` means pairing was attempted but Windows has not published the
 /// SPP port yet, which is a retryable state the UI must report differently
 /// from a hard failure.
+#[derive(Debug)]
 enum BtPortError {
     NotReady(String),
     Failed(String),
@@ -1275,19 +1276,74 @@ enum BtPortError {
 /// appears asynchronously and several rows can exist for one MAC, so the port
 /// is always chosen by MAC and never by number.
 fn bluetooth_port_for(mac: &str) -> Result<String, BtPortError> {
+    wait_for_spp_port(mac, Duration::from_secs(2))
+}
+
+/// How long to wait for Windows to publish the SPP port.
+///
+/// Measured cold-start binding takes 1.0–1.1 s and 1.65 s at worst after the
+/// device has been idle for 150 s, so 2 s (20 polls at 100 ms) covers it. A
+/// longer budget would only make "the device is not here" feel like a hang.
+fn wait_for_spp_port(mac: &str, budget: Duration) -> Result<String, BtPortError> {
     let address = crate::bluetooth::Mac::parse(mac).ok_or_else(|| {
         BtPortError::NotReady("MAC 地址无法解析，请重新扫描设备列表".into())
     })?;
     let backend = crate::bluetooth::backend();
+    // Once, outside the loop: repeating it cannot help and each call may
+    // trigger a system-level renegotiation.
     backend.ensure_spp(address).map_err(BtPortError::Failed)?;
-    let ports = backend.spp_ports().map_err(BtPortError::Failed)?;
-    crate::bluetooth::choose_port_for_mac(&ports, address)
-        .map(|port| port.port_name.clone())
-        .ok_or_else(|| {
-            BtPortError::NotReady(
-                "系统还没有为该设备建立串口，请确认写字机已开机且未被手机占用".into(),
-            )
-        })
+    poll_for_port(|| backend.spp_ports(), address, budget)
+}
+
+/// Re-asks `list` for the SPP port bound to `address` until `budget` runs out.
+///
+/// A remembered device's port appears as soon as `ensure_spp` returns, but a
+/// never-paired one needs discovery and an SDP query first, so the very first
+/// click would otherwise always report "系统还没有为该设备建立串口".
+///
+/// `list` is a closure rather than a direct `backend()` call so this can be
+/// tested without hardware. The port name is re-derived on every round because
+/// it can change while Windows rebuilds the binding.
+fn poll_for_port<F>(mut list: F, address: crate::bluetooth::Mac, budget: Duration) -> Result<String, BtPortError>
+where
+    F: FnMut() -> Result<Vec<crate::bluetooth::SppPort>, String>,
+{
+    let end = Instant::now() + budget;
+    loop {
+        match crate::bluetooth::choose_port_for_mac(
+            &list().map_err(BtPortError::Failed)?,
+            address,
+        ) {
+            Some(port) => return Ok(port.port_name.clone()),
+            None if Instant::now() >= end => {
+                return Err(BtPortError::NotReady(
+                    "系统还没有为该设备建立串口，请确认写字机已开机且未被手机占用".into(),
+                ))
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Rebuilds the SPP binding for `mac` and connects to the port it produces.
+///
+/// This deliberately goes through `connect` rather than hand-writing
+/// `open_link` + `handshake`: the real connect also runs `recover_session`,
+/// which establishes Idle before the identity query so a retained Hold cannot
+/// swallow `$I`. Rebinding exists to fix a vanished port, not to skip recovery.
+///
+/// Returns the port name alongside the link because the new port is not the one
+/// the caller tried, so the caller must report the port it actually opened.
+fn rebind_once(mac: &str, swap_xy: bool) -> Result<(String, Link, Status), String> {
+    // BtPortError has no `describe`; match it out the way the BtConnect arm does.
+    let name = match bluetooth_port_for(mac) {
+        Ok(name) => name,
+        Err(BtPortError::NotReady(reason)) | Err(BtPortError::Failed(reason)) => {
+            return Err(reason)
+        }
+    };
+    let (link, status) = connect(&name, swap_xy)?;
+    Ok((name, link, status))
 }
 fn accept_ack(pending: &mut Option<Instant>) -> Result<(), String> {
     pending
@@ -1427,10 +1483,37 @@ fn worker_loop(
                 DeviceCommand::Connect { port: name, swap_xy: requested, flip_y: invert_y } => {
                     swap_xy = requested;
                     set_flip_y(invert_y);
-                    match connect(&name, swap_xy) {
-                    Ok((l, s)) => {
+                    let opened = match connect(&name, swap_xy) {
+                        Ok((l, s)) => Ok((name.clone(), l, s)),
+                        Err(e) => {
+                            // Only enumerate on the failure path. Enumerating up
+                            // front would add a serial + registry sweep to every
+                            // USB connect and would let a broken enumeration
+                            // refuse a port that actually opens.
+                            let rebind = DeviceService::ports()
+                                .ok()
+                                .and_then(|p| p.into_iter().find(|p| p.name == name))
+                                .filter(|p| p.kind == PortKind::Bluetooth)
+                                .and_then(|p| p.mac)
+                                .filter(|_| {
+                                    crate::bluetooth::should_rebind_spp(
+                                        PortKind::Bluetooth,
+                                        0,
+                                        &e,
+                                    )
+                                });
+                            // A second failure reports the original error:
+                            // whatever the first probe saw is the diagnosis.
+                            match rebind.map(|mac| rebind_once(&mac, swap_xy)) {
+                                Some(Ok(opened)) => Ok(opened),
+                                Some(Err(_)) | None => Err(e),
+                            }
+                        }
+                    };
+                    match opened {
+                    Ok((port, l, s)) => {
                         link = Some(l);
-                        connected_port = Some(name.clone());
+                        connected_port = Some(port.clone());
                         last_received = Instant::now();
                         held_after_stop = s.state != "Idle";
                         status = s.clone();
@@ -1439,7 +1522,7 @@ fn worker_loop(
                         explicit_origin = false;
                         emit(DeviceEvent::AutoOrigin(true));
                         emit(DeviceEvent::CalibrationChanged { origin: None });
-                        emit(DeviceEvent::Connected(name));
+                        emit(DeviceEvent::Connected(port));
                         emit(DeviceEvent::Status(s));
                     }
                     Err(e) => emit(DeviceEvent::Error(e)),
@@ -1495,8 +1578,28 @@ fn worker_loop(
                             emit(DeviceEvent::BtPortNotReady { mac, reason })
                         }
                         Err(BtPortError::Failed(message)) => emit(DeviceEvent::Error(message)),
-                        Ok(name) => match connect(&name, swap_xy) {
-                            Ok((l, s)) => {
+                        Ok(name) => {
+                            let opened = match connect(&name, swap_xy) {
+                                Ok((l, s)) => Ok((name, l, s)),
+                                Err(e) => {
+                                    // The MAC is already in hand on this path,
+                                    // so no enumeration is needed to know that a
+                                    // fresh SPP port is the fix.
+                                    if crate::bluetooth::should_rebind_spp(
+                                        PortKind::Bluetooth,
+                                        0,
+                                        &e,
+                                    ) {
+                                        // A second failure reports the original
+                                        // error: the first probe is the diagnosis.
+                                        rebind_once(&mac, swap_xy).map_err(|_| e)
+                                    } else {
+                                        Err(e)
+                                    }
+                                }
+                            };
+                            match opened {
+                            Ok((name, l, s)) => {
                                 link = Some(l);
                                 connected_port = Some(name.clone());
                                 last_received = Instant::now();
@@ -1510,8 +1613,9 @@ fn worker_loop(
                                 emit(DeviceEvent::Connected(name));
                                 emit(DeviceEvent::Status(s));
                             }
-                            Err(e) => emit(DeviceEvent::Error(e)),
-                        },
+                                Err(e) => emit(DeviceEvent::Error(e)),
+                            }
+                        }
                     }
                 }
                 DeviceCommand::Disconnect => {
@@ -5955,5 +6059,44 @@ mod tests {
     fn auto_select_accepts_a_lone_usable_bluetooth_port() {
         let plotter = [port_with_mac("COM7", PortKind::Bluetooth, true, "70:4B:CA:72:AC:A2")];
         assert_eq!(auto_select_candidate(&plotter).unwrap().name, "COM7");
+    }
+
+    fn spp_port(name: &str) -> crate::bluetooth::SppPort {
+        crate::bluetooth::SppPort {
+            port_name: name.into(),
+            mac: crate::bluetooth::Mac::parse("70:4B:CA:72:AC:A2").unwrap(),
+            instance: "a&2e6f9637&0&704BCA72ACA2_C00000000".into(),
+        }
+    }
+
+    /// A never-paired device needs discovery plus an SDP query, so Windows
+    /// publishes its SPP port a beat after `ensure_spp` returns. The first click
+    /// must still connect, so the lookup has to keep asking for a while.
+    #[test]
+    fn spp_port_poll_returns_the_port_that_appears_late() {
+        let mut rounds = vec![vec![], vec![spp_port("COM7")]].into_iter();
+        let name = poll_for_port(
+            || Ok(rounds.next().unwrap_or_default()),
+            crate::bluetooth::Mac::parse("70:4B:CA:72:AC:A2").unwrap(),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(name, "COM7");
+    }
+
+    #[test]
+    fn spp_port_poll_gives_up_with_a_chinese_reason() {
+        let err = poll_for_port(
+            || Ok(Vec::new()),
+            crate::bluetooth::Mac::parse("70:4B:CA:72:AC:A2").unwrap(),
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        match err {
+            BtPortError::NotReady(reason) => {
+                assert!(reason.contains("还没有为该设备建立串口"), "{reason}")
+            }
+            BtPortError::Failed(message) => panic!("expected a retryable reason, got {message}"),
+        }
     }
 }
