@@ -29,7 +29,25 @@ test("bluetooth devices show pairing state in chinese", () => {
 
 test("silent reconnect only targets the remembered mac that is really present", () => {
   assert.equal(silentReconnectTarget(null, []), null);
-  assert.equal(silentReconnectTarget("70:4B:CA:72:AC:A2", [{name:"COM13", kind:"usb"}]), null);
+  assert.equal(silentReconnectTarget("", []), null);
+  // A USB port is never a Bluetooth target, even when it claims the same address.
+  assert.equal(
+    silentReconnectTarget("70:4B:CA:72:AC:A2", [{name:"COM13", kind:"usb", mac:"70:4B:CA:72:AC:A2"}]),
+    null
+  );
+  // Two Bluetooth ports: the remembered address decides, not the port order.
+  assert.equal(
+    silentReconnectTarget("70:4B:CA:72:AC:A2", [
+      {name:"COM4", kind:"bluetooth", mac:"11:11:11:11:27:A9"},
+      {name:"COM7", kind:"bluetooth", mac:"70:4B:CA:72:AC:A2"},
+    ]),
+    "COM7"
+  );
+  // The remembered machine is absent: nothing is opened on its behalf.
+  assert.equal(
+    silentReconnectTarget("70:4B:CA:72:AC:A2", [{name:"COM4", kind:"bluetooth", mac:"11:11:11:11:27:A9"}]),
+    null
+  );
   assert.equal(
     silentReconnectTarget("70:4B:CA:72:AC:A2", [{name:"COM7", kind:"bluetooth", mac:"70:4B:CA:72:AC:A2"}]),
     "COM7"

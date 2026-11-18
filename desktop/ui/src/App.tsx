@@ -595,6 +595,11 @@ export default function App() {
     try { return window.localStorage.getItem("openink-bt-mac") ?? ""; }
     catch { return ""; }
   });
+  // How the live link was opened. The port list is refreshed only by an explicit
+  // scan, so the SPP port that `ensure_spp` created during a Bluetooth connect is
+  // missing from it — without this the panel could not say 「蓝牙」 and would not
+  // offer 「改用 USB 连接」 on exactly the machine that needs it.
+  const [connectedVia, setConnectedVia] = useState<"usb" | "bluetooth" | "other" | null>(null);
   const [feed, setFeed] = useState(4500),
     [travelFeed, setTravelFeed] = useState(3500),
     [zFeed, setZFeed] = useState(4500),
@@ -667,8 +672,6 @@ export default function App() {
   connectedRef.current = connected;
   const portsRef = useRef(ports);
   portsRef.current = ports;
-  const autoConnectRef = useRef(autoConnect);
-  autoConnectRef.current = autoConnect;
   const rememberedMacRef = useRef(rememberedMac);
   rememberedMacRef.current = rememberedMac;
   const swapXYRef = useRef(swapXY);
@@ -912,9 +915,9 @@ export default function App() {
   const wcoKnown =
     status.wco?.length === 3 && status.wco.every((v) => Number.isFinite(v));
   const canJog = !!connected && !machineBusy && status.state === "Idle";
-  // Which physical link the machine is on right now. The port list carries the
-  // kind, so no extra backend call is needed.
-  const connectedKind = ports.find((p) => p.name === connected)?.kind;
+  // Which physical link the machine is on right now. Prefer what the last connect
+  // reported, because `ports` still describes the world before that connect.
+  const connectedKind = connectedVia ?? ports.find((p) => p.name === connected)?.kind;
   useJogKeys(rightOpen && rightTab === "machine" && canJog && !busy && !inkFontOpen, jogStep, travelFeed, command);
   const canPen =
     canJog &&
@@ -1349,15 +1352,23 @@ export default function App() {
               // One silent attempt per launch. A machine that is out of range must
               // not raise the recovery card or a dialog on every start; the status
               // line alone says the Bluetooth link did not come up.
+              //
+              // This is deliberately not gated on the 「自动识别连接」 toggle: that
+              // toggle starts off and is never persisted, and the port list arrives
+              // a fraction of a second after mount, so gating on it would spend the
+              // single attempt before the user could ever switch it on. Having
+              // remembered a MAC is itself the opt-in.
               if (!reconnectTried.current) {
                 reconnectTried.current = true;
                 const target = silentReconnectTarget(rememberedMacRef.current || null, nextPorts);
-                if (target && !connectedRef.current && autoConnectRef.current) {
+                if (target && !connectedRef.current) {
                   silentReconnect.current = true;
+                  pendingBtMac.current = rememberedMacRef.current || null;
                   void call("device_command", {
                     command: { type: "connect", port: target, swap_xy: swapXYRef.current, flip_y: flipYRef.current },
                   }).catch(() => {
                     silentReconnect.current = false;
+                    pendingBtMac.current = null;
                     setStatus({ state: "蓝牙未连接" });
                   });
                 }
@@ -1375,13 +1386,22 @@ export default function App() {
               setConnectionError(false);
               setBtScanning(false);
               silentReconnect.current = false;
-              if (pendingBtMac.current) {
-                // Remember the machine, not the COM name: Windows hands out a new
-                // one after every pairing, so only the MAC survives a reboot.
-                setRememberedMac(pendingBtMac.current);
-                try { window.localStorage.setItem("openink-bt-mac", pendingBtMac.current); }
-                catch { /* storage is optional; the link still works without memory */ }
-                pendingBtMac.current = null;
+              {
+                // A parked MAC means the link came up over Bluetooth, so that is the
+                // authoritative answer. Otherwise fall back to what the last port
+                // sweep said about this port name — which is all a USB link needs.
+                const parked = pendingBtMac.current;
+                if (parked) {
+                  // Remember the machine, not the COM name: Windows hands out a new
+                  // one after every pairing, so only the MAC survives a reboot.
+                  setRememberedMac(parked);
+                  try { window.localStorage.setItem("openink-bt-mac", parked); }
+                  catch { /* storage is optional; the link still works without memory */ }
+                  pendingBtMac.current = null;
+                }
+                setConnectedVia(
+                  parked ? "bluetooth" : portsRef.current.find((p) => p.name === e.port)?.kind ?? "other",
+                );
               }
               setConnected(e.port || "");
               notify(`已连接 ${e.port}`);
@@ -1395,6 +1415,7 @@ export default function App() {
               submittedStrokes.current = null;
               submittedOrderedIds.current = [];
               setConnected("");
+              setConnectedVia(null);
               setRunning(false);
               setPositioning(false);
               setMachineOriginReady(false);
@@ -1507,7 +1528,11 @@ export default function App() {
               break;
             case "bt_error":
               setBtScanning(false);
-              notify(e.message || "蓝牙链接没有建立，请确认机器已开机并靠近电脑后重试", true);
+              // `bt_connect` reports a port that never appeared this way, so the
+              // parked MAC has to go with it: a MAC that outlives its failed attempt
+              // would make the next USB link look like a Bluetooth one.
+              pendingBtMac.current = null;
+              notify(e.message || "蓝牙链路没有建立，请确认机器已开机并靠近电脑后重试。", true);
               break;
             case "link_warning":
               setBtScanning(false);
@@ -1523,6 +1548,10 @@ export default function App() {
                 // line says 蓝牙未连接 and nothing else. A red notice on every
                 // start would be read as a fault.
                 silentReconnect.current = false;
+                // Drop the parked MAC too, or a later USB connect would be filed
+                // under the Bluetooth link and offer 「改用 USB 连接」 for a port
+                // that is already USB.
+                pendingBtMac.current = null;
                 setStatus({ state: "蓝牙未连接" });
                 break;
               }
@@ -3440,7 +3469,7 @@ export default function App() {
                       <button
                         className="icon-button bordered"
                         title="扫描蓝牙设备"
-                        disabled={btScanning || machineBusy || !!connected}
+                        disabled={btScanning || machineBusy}
                         onClick={() => void scanBluetooth()}
                       >
                         {btScanning ? (
