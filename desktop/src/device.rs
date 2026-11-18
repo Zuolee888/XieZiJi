@@ -1361,23 +1361,26 @@ fn rebind_once(mac: &str, swap_xy: bool) -> Result<(String, Link, Status), Strin
 }
 /// Link kind of a bare port name, decided after the connect already succeeded.
 ///
-/// Only a name is in hand here, so SPP membership is the sole evidence: a port
-/// that has a registry row is Bluetooth, anything else is treated as USB.
-/// `spp_ports()` reads the registry only and turns any failure into an empty
-/// list, so a broken enumeration degrades to `Usb` and the warning is skipped
-/// rather than blocking the connection. That ordering is the whole point: Task 7
-/// promised that a manual USB connect pays for no enumeration, and that a broken
-/// enumeration can never refuse a port that actually opens. Running this only
-/// after the port opened keeps both promises — a slow or failing registry sweep
-/// can no longer influence whether the connection succeeds.
+/// Only a name is in hand here, so SPP membership is the sole evidence.
+///
+/// A *successful* sweep that lacks the name means USB. A *failed* sweep means
+/// we do not know, and the answer is `Other` rather than `Usb`: classifying an
+/// unknown link as USB would arm the both-links-live warning, and the firmware
+/// reports `Status=Connected with <peer>` precisely when this machine is the
+/// peer — so a broken registry read would greet a user who is legitimately on
+/// Bluetooth with "the machine is taken by another Bluetooth link". `Other`
+/// stays silent in `link_warning`, which is the honest answer when the sweep
+/// could not run.
+///
+/// Running this only after the port opened is the whole point: Task 7 promised
+/// that a manual USB connect pays for no enumeration, and that a broken
+/// enumeration can never refuse a port that actually opens. A slow or failing
+/// sweep here can no longer influence whether the connection succeeds.
 fn kind_after_connect(name: &str) -> PortKind {
-    if crate::bluetooth::spp_ports()
-        .iter()
-        .any(|p| p.port_name == name)
-    {
-        PortKind::Bluetooth
-    } else {
-        PortKind::Usb
+    match crate::bluetooth::try_spp_ports() {
+        Ok(ports) if ports.iter().any(|p| p.port_name == name) => PortKind::Bluetooth,
+        Ok(_) => PortKind::Usb,
+        Err(_) => PortKind::Other,
     }
 }
 
@@ -1386,6 +1389,22 @@ fn emit_link_warning(events: &Sender<DeviceEvent>, kind: PortKind, observations:
     let mode = crate::bluetooth::parse_link_mode(observations);
     if let Some(message) = crate::bluetooth::link_warning(kind, &mode) {
         let _ = events.send(DeviceEvent::LinkWarning(message));
+    }
+}
+
+/// Reports a Bluetooth link whose controller claims no peer at all.
+///
+/// The design asks for this anomaly to be logged, not warned about: we opened
+/// an SPP port and are talking to the controller, yet `$I` says the Bluetooth
+/// link is idle. Nothing is unsafe — there is only one link — but it is the
+/// fingerprint of opening a *stale* SPP row that Windows maps to a different
+/// peer (or of a firmware that stopped reporting). Silent in the UI, present in
+/// the log for the next hardware session.
+fn log_idle_bluetooth_link(events: &Sender<DeviceEvent>, observations: &[String]) {
+    if crate::bluetooth::parse_link_mode(observations) == crate::bluetooth::LinkMode::BluetoothIdle {
+        let _ = events.send(DeviceEvent::Log(
+            "Bluetooth link reports no connected peer; verify the port still maps to the plotter".into(),
+        ));
     }
 }
 
@@ -1655,10 +1674,11 @@ fn worker_loop(
                             let opened = match connect(&name, swap_xy) {
                                 // This arm opened the SPP port itself, so the
                                 // kind is definitively Bluetooth and a peer
-                                // cannot be holding it: the observations are
-                                // dropped rather than parsed for a warning that
-                                // `link_warning` could never produce.
-                                Ok((l, s, _)) => Ok((name, l, s)),
+                                // cannot be holding it — `link_warning` can
+                                // never fire here. The observations are still
+                                // worth keeping for the idle-link anomaly check,
+                                // which is a different question.
+                                Ok((l, s, observations)) => Ok((name, l, s, observations)),
                                 Err(e) => {
                                     // The MAC is already in hand on this path,
                                     // so no enumeration is needed to know that a
@@ -1675,7 +1695,11 @@ fn worker_loop(
                                         // stays distinguishable from a port
                                         // that Windows never re-published.
                                         match rebind_once(&mac, swap_xy) {
-                                            Ok(opened) => Ok(opened),
+                                            // A rebound port is Bluetooth and
+                                            // we opened it ourselves, so no
+                                            // peer can hold it: the idle-link
+                                            // check has nothing to read.
+                                            Ok((port, l, s)) => Ok((port, l, s, vec![])),
                                             Err(rebind_error) => {
                                                 emit(DeviceEvent::Log(format!(
                                                     "SPP rebind failed: {rebind_error}"
@@ -1689,7 +1713,7 @@ fn worker_loop(
                                 }
                             };
                             match opened {
-                            Ok((name, l, s)) => {
+                            Ok((name, l, s, observations)) => {
                                 link = Some(l);
                                 connected_port = Some(name.clone());
                                 last_received = Instant::now();
@@ -1702,6 +1726,11 @@ fn worker_loop(
                                 emit(DeviceEvent::CalibrationChanged { origin: None });
                                 emit(DeviceEvent::Connected(name));
                                 emit(DeviceEvent::Status(s));
+                                // No warning is possible on this path, but a
+                                // controller that claims its Bluetooth link is
+                                // idle while we are talking over it is worth a
+                                // line in the log.
+                                log_idle_bluetooth_link(&events, &observations);
                             }
                                 Err(e) => emit(DeviceEvent::Error(e)),
                             }
@@ -3132,9 +3161,15 @@ mod tests {
             swap_xy: false,
         };
         let mut lines = vec![];
-        while lines.last().map(String::as_str) != Some("ok") {
+        // Bounded so a regression in Link::lines() fails instead of hanging the
+        // suite: an unbounded loop would spin forever once the wire runs dry.
+        for _ in 0..8 {
+            if lines.last().map(String::as_str) == Some("ok") {
+                break;
+            }
             lines.extend(link.lines().unwrap());
         }
+        assert_eq!(lines.last().map(String::as_str), Some("ok"), "the reply must terminate");
         assert_eq!(
             crate::bluetooth::parse_link_mode(&lines),
             crate::bluetooth::LinkMode::BluetoothConnected("4C:23:38:0C:97:4C".into())

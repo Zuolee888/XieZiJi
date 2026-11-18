@@ -196,8 +196,9 @@ pub enum LinkMode {
 ///
 /// Only whole lines are considered: a `[MSG:` line is matched from its start, so
 /// ordinary text that merely mentions the mode cannot be mistaken for it. The
-/// peer MAC is kept exactly as printed — the caller compares it, so normalising
-/// case here would hide a real mismatch.
+/// peer MAC is kept exactly as printed — it is meant to be shown to a user
+/// diagnosing which link is live, so normalising its case would misquote the
+/// firmware.
 pub fn parse_link_mode(lines: &[String]) -> LinkMode {
     for line in lines {
         let Some(rest) = line.strip_prefix("[MSG:Mode=BT:") else {
@@ -227,8 +228,10 @@ pub fn parse_link_mode(lines: &[String]) -> LinkMode {
 ///
 /// A USB connection whose controller already holds a Bluetooth peer means both
 /// links can deliver G-code, and interleaved motion is a ruined drawing. The
-/// reverse is impossible: a Bluetooth link we opened is the only link the
-/// firmware can report as connected, so no warning is ever needed there.
+/// reverse needs no warning, for a narrower reason than symmetry would suggest:
+/// the firmware's `$I` reply reports the Bluetooth peer, never a USB host, so a
+/// link we opened over Bluetooth can never be reported as contended even when a
+/// USB session is live alongside it.
 pub fn link_warning(kind: PortKind, mode: &LinkMode) -> Option<String> {
     if kind == PortKind::Usb && matches!(mode, LinkMode::BluetoothConnected(_)) {
         Some(
@@ -287,6 +290,17 @@ pub fn bt_device_from(mac: &str, name: &str, remembered: i32, authenticated: i32
 /// SPP ports currently registered with Windows.
 pub fn spp_ports() -> Vec<SppPort> {
     backend().spp_ports().unwrap_or_default()
+}
+
+/// The same registry read, but a failure stays a failure.
+///
+/// `spp_ports()` above turns a broken enumeration into an empty list, which is
+/// right when the answer is only used to *offer* a port. It is wrong when the
+/// absence of a row is read as evidence: an empty list and a failed sweep look
+/// identical, so a caller that concludes "this is not Bluetooth" from an empty
+/// list would mislabel a link it is in fact holding.
+pub fn try_spp_ports() -> Result<Vec<SppPort>, String> {
+    backend().spp_ports()
 }
 
 #[cfg(not(windows))]
@@ -831,10 +845,17 @@ mod tests {
     #[test]
     fn warns_only_when_bluetooth_holds_the_link_we_did_not_open() {
         let peer = LinkMode::BluetoothConnected("4C:23:38:0C:97:4C".into());
-        assert!(link_warning(PortKind::Usb, &peer).is_some());
+        assert_eq!(
+            link_warning(PortKind::Usb, &peer).as_deref(),
+            Some("机械同时被蓝牙链路占用，两条链路同时下发指令会让动作交错。请关闭其中一条连接后再开始书写"),
+            "the exact sentence is the product of this whole task"
+        );
         assert!(link_warning(PortKind::Bluetooth, &peer).is_none());
         assert!(link_warning(PortKind::Usb, &LinkMode::BluetoothIdle).is_none());
         assert!(link_warning(PortKind::Usb, &LinkMode::Unknown).is_none());
+        // `Other` is what a failed SPP sweep produces. Warning there would tell a
+        // user who is legitimately on Bluetooth that someone else holds the link.
+        assert!(link_warning(PortKind::Other, &peer).is_none());
     }
 
     #[test]

@@ -915,6 +915,20 @@ mod tests {
         assert!(v.get("mac").is_none(), "the payload carries no mac; the panel retries from its list");
     }
     #[test]
+    fn link_warning_event_becomes_a_notification_payload() {
+        // Task 10 keys its toast on "link_warning"; a rename here would silently
+        // drop the only signal that two links are fighting over the machine.
+        let v = map_event(DeviceEvent::LinkWarning(
+            "机械同时被蓝牙链路占用，两条链路同时下发指令会让动作交错。请关闭其中一条连接后再开始书写"
+                .into(),
+        ));
+        assert_eq!(v["type"], "link_warning");
+        assert_eq!(
+            v["message"],
+            "机械同时被蓝牙链路占用，两条链路同时下发指令会让动作交错。请关闭其中一条连接后再开始书写"
+        );
+    }
+    #[test]
     fn font_layout_jitter_preserves_paths_and_repeats_with_seed() {
         let path = Path::new("C:/Windows/Fonts/arial.ttf");
         if !path.exists() { return; }
