@@ -106,7 +106,15 @@ npm run dev
 ## §3 已知遗留
 
 1. **`poll_for_port` 的承重假设未验证**：`BluetoothSetServiceState(ENABLE)` 是否真能驱逐失败的那条陈旧注册表行。若不能，`poll_for_port` 会立刻返回同一个 COM 名、第二次 `connect` 同样失败。看 §2 第 14 条 —— 若重绑后端口号**从不变化**，该假设就不成立。
-2. **退避接线的覆盖缺口**：把 `device.rs` 里端口存在性谓词取反、以及把「切片中止 + `Stopped`」一起改回 `Failed(...)`，两种变异都仍然 `211 passed / 0 failed`。测试没抓到，靠 §2 第 9、10、12 条人工兜。
+2. **退避接线的覆盖缺口（已用变异逐条实测，不是推测）**：在 `HEAD` 的干净副本里做三组变异，跑 `cargo test --bins`：
+
+   | 变异 | 位置 | 结果 |
+   | --- | --- | --- |
+   | C：把两条具体排除串换成 blanket `"Recovery "` | `desktop/src/bluetooth.rs` `should_rebind_spp` | **抓到了**：`rebind_still_retries_the_message_that_actually_means_a_dead_link` 失败，210 passed / 1 failed |
+   | A：把端口存在性谓词取反（`still_listed` → `!still_listed`） | `desktop/src/device.rs:806-808` | **没抓到**：211 passed / 0 failed |
+   | B：把 `Stopped` 分支改成发 `Failed` 文案 | `desktop/src/device.rs:3058` | **没抓到**：211 passed / 0 failed |
+
+   A 与 B 抓不到的原因是同一个：两者的正确性都活在 `worker_loop` 的接线里，而该循环没有注入点 —— `open_link` 直接调 `serialport::available_ports()`，`BluetoothRecovery` 的三路 `match` 又直接 `emit`。函数本身有测试，把它们接到循环上的那一层没有。要补需要给 `worker_loop` 加可注入的 backend 抽象，属于结构调整而非补测试，本期未做。**因此 §2 第 9、10、12、13 条人工走查不能跳过。**
 3. **「停止」只保证退避等待可中断**：若 `Stop` 正好落进某一次 `reconnect_bluetooth_once` 内部，仍需等完那一次（约 12 s），200 ms 上界不覆盖该情形。
 4. **占用/消失区分未在非中文 Windows 上验证**：判定逻辑本身不依赖语言，但没有任何非中文环境可测。
 5. **已记忆设备未落盘 `LinkKey`**（`auth=0 remembered=16`），换电脑需重新 `SetServiceState` —— 设计文档 §7 未知项 6。
