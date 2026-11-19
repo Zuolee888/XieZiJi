@@ -189,13 +189,10 @@ pub enum DeviceEvent {
     /// Bluetooth discovery result, separate from the serial port list because
     /// an unpaired device has no COM port yet.
     BtDevices(Vec<crate::bluetooth::BtDevice>),
-    /// Pairing succeeded but no SPP port carries the requested MAC yet. `mac`
-    /// is kept for the retry path inside this module; the IPC payload only
-    /// carries `reason`, because the panel retries from its device list.
-    BtPortNotReady {
-        mac: String,
-        reason: String,
-    },
+    /// Pairing succeeded but no SPP port carries the requested MAC yet. Only the
+    /// reason crosses the IPC boundary: the panel retries from its device list,
+    /// where the device the user just clicked is still the selected one.
+    BtPortNotReady { reason: String },
     Connected(String),
     /// Both a USB and a Bluetooth link are live at once. Sent once per newly
     /// established connection, never on recovery.
@@ -1797,7 +1794,7 @@ fn worker_loop(
                     set_flip_y(invert_y);
                     match bluetooth_port_for(&mac) {
                         Err(BtPortError::NotReady(reason)) => {
-                            emit(DeviceEvent::BtPortNotReady { mac, reason })
+                            emit(DeviceEvent::BtPortNotReady { reason })
                         }
                         Err(BtPortError::Failed(message)) => emit(DeviceEvent::Error(message)),
                         Ok(name) => {

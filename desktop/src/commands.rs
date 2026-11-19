@@ -218,7 +218,7 @@ fn map_event(e: DeviceEvent) -> Value {
     match e {
         DeviceEvent::Ports(ports) => json!({"type":"ports","ports":ports}),
         DeviceEvent::BtDevices(devices) => json!({"type":"bt_devices","devices":devices}),
-        DeviceEvent::BtPortNotReady { reason, .. } => {
+        DeviceEvent::BtPortNotReady { reason } => {
             json!({"type":"bt_error","message":reason})
         }
         DeviceEvent::AutoOrigin(automatic) => {
@@ -907,7 +907,6 @@ mod tests {
         // The panel keys its retry hint on "bt_error"; renaming this string would
         // silently stop telling the user to tap connect again after a first pairing.
         let v = map_event(DeviceEvent::BtPortNotReady {
-            mac: "70:4B:CA:72:AC:A2".into(),
             reason: "系统还没有为该设备建立串口，请确认写字机已开机且未被手机占用".into(),
         });
         assert_eq!(v["type"], "bt_error");
