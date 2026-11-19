@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {portLabel, deviceLabel, silentReconnectTarget} from "./btPanelModel.ts";
+import {portLabel, deviceLabel, silentReconnectTarget, launchReconnect} from "./btPanelModel.ts";
 
 test("usb ports keep the CH340 badge and bluetooth ports say bluetooth", () => {
   assert.equal(
@@ -51,5 +51,29 @@ test("silent reconnect only targets the remembered mac that is really present", 
   assert.equal(
     silentReconnectTarget("70:4B:CA:72:AC:A2", [{name:"COM7", kind:"bluetooth", mac:"70:4B:CA:72:AC:A2"}]),
     "COM7"
+  );
+});
+
+test("a cold start reconnects by mac when windows dropped the port", () => {
+  // Nothing remembered: no attempt at all.
+  assert.equal(launchReconnect(null, []), null);
+  assert.equal(launchReconnect("", []), null);
+  // The usual warm start: the port is already published, so name it directly.
+  assert.deepEqual(
+    launchReconnect("70:4B:CA:72:AC:A2", [{name:"COM7", kind:"bluetooth", mac:"70:4B:CA:72:AC:A2"}]),
+    {port:"COM7"}
+  );
+  // The case the feature exists for: the machine was off, Windows dropped the
+  // SPP row, so there is no port to name and the backend must re-bind by address.
+  assert.deepEqual(launchReconnect("70:4B:CA:72:AC:A2", []), {mac:"70:4B:CA:72:AC:A2"});
+  // Another machine's port must not stand in for the remembered one.
+  assert.deepEqual(
+    launchReconnect("70:4B:CA:72:AC:A2", [{name:"COM4", kind:"bluetooth", mac:"11:11:11:11:27:A9"}]),
+    {mac:"70:4B:CA:72:AC:A2"}
+  );
+  // A USB port carrying the same address is still not the remembered machine.
+  assert.deepEqual(
+    launchReconnect("70:4B:CA:72:AC:A2", [{name:"COM13", kind:"usb", mac:"70:4B:CA:72:AC:A2"}]),
+    {mac:"70:4B:CA:72:AC:A2"}
   );
 });

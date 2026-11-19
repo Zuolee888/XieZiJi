@@ -19,7 +19,7 @@ import Toggle from "./Toggle";
 import RegistrationHandles from "./RegistrationHandles";
 import { RegistrationPanel, type RegistrationProfile, type RegistrationSetup } from "./RegistrationPanel";
 import { machineScene } from "./machineScene";
-import { deviceLabel, portLabel, silentReconnectTarget } from "./btPanelModel";
+import { deviceLabel, launchReconnect, portLabel } from "./btPanelModel";
 import { identityRegistration, registrationMatrix, registrationScales, scaledRegistration, type Registration } from "./coordinateGeometry";
 import { ensureStrokeIds, unwrittenDocument, completedStrokeIds, resetWrittenSelection, markCompletedStroke } from "./writtenTracking";
 import { DraftNumberInput } from "./DraftNumberInput";
@@ -1360,13 +1360,20 @@ export default function App() {
               // remembered a MAC is itself the opt-in.
               if (!reconnectTried.current) {
                 reconnectTried.current = true;
-                const target = silentReconnectTarget(rememberedMacRef.current || null, nextPorts);
-                if (target && !connectedRef.current) {
+                const remembered = rememberedMacRef.current || null;
+                const launch = launchReconnect(remembered, nextPorts);
+                if (launch && !connectedRef.current) {
                   silentReconnect.current = true;
-                  pendingBtMac.current = rememberedMacRef.current || null;
-                  void call("device_command", {
-                    command: { type: "connect", port: target, swap_xy: swapXYRef.current, flip_y: flipYRef.current },
-                  }).catch(() => {
+                  pendingBtMac.current = remembered;
+                  // The remembered port is the cheap path, but it is gone exactly
+                  // when the machine was off: Windows drops the SPP row, so a
+                  // plain `connect` would name a port that no longer exists. The
+                  // MAC fallback re-binds the service first, which is the only
+                  // thing that can rebuild the row.
+                  const request = "port" in launch
+                    ? { type: "connect", port: launch.port, swap_xy: swapXYRef.current, flip_y: flipYRef.current }
+                    : { type: "bt_connect", mac: launch.mac, swap_xy: swapXYRef.current, flip_y: flipYRef.current };
+                  void call("device_command", { command: request }).catch(() => {
                     silentReconnect.current = false;
                     pendingBtMac.current = null;
                     setStatus({ state: "蓝牙未连接" });
@@ -3462,7 +3469,7 @@ export default function App() {
                           {btScanning
                             ? "正在扫描附近的蓝牙机器，请稍候"
                             : btDevices.length
-                              ? "点「连接」即可建立蓝牙链路，未配对的机器会在连接时自动完成配对"
+                              ? "点「连接」即可建立蓝牙链路；若机器从未与本机配对，请先在「设置 › 蓝牙和其他设备」里配对"
                               : "点右侧按钮扫描，就近查找已开启蓝牙的机器"}
                         </small>
                       </span>

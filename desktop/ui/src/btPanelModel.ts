@@ -42,3 +42,19 @@ export function silentReconnectTarget(
   );
   return match ? match.name : null;
 }
+
+// What the launch-time reconnect should ask the backend for. A remembered port
+// is the cheap path, but it is also the one that is missing exactly when it is
+// needed: Windows drops the SPP row while the machine is off, so the cold start
+// the feature exists for has no port to name. Falling back to the remembered
+// address lets the backend re-bind the service before opening anything.
+export type LaunchReconnect = { port: string } | { mac: string };
+
+export function launchReconnect(
+  rememberedMac: string | null,
+  ports: PortLike[],
+): LaunchReconnect | null {
+  if (!rememberedMac) return null;
+  const port = silentReconnectTarget(rememberedMac, ports);
+  return port ? { port } : { mac: rememberedMac };
+}
