@@ -1312,14 +1312,37 @@ fn bluetooth_port_for(mac: &str) -> Result<String, BtPortError> {
 /// device has been idle for 150 s, so 2 s (20 polls at 100 ms) covers it. A
 /// longer budget would only make "the device is not here" feel like a hang.
 fn wait_for_spp_port(mac: &str, budget: Duration) -> Result<String, BtPortError> {
+    wait_for_spp_port_with(&*crate::bluetooth::backend(), mac, budget)
+}
+
+/// The injectable body of [`wait_for_spp_port`].
+///
+/// `BluetoothSetServiceState(ENABLE)` answers `ERROR_INVALID_PARAMETER` (87)
+/// when the service is *already* enabled, which is the ordinary state of a
+/// machine that has been paired before. Treating that as a failure made the
+/// scan list refuse a device whose port the port list could already open, so an
+/// error from it is not conclusive: the port existing is what the caller asked
+/// for.
+fn wait_for_spp_port_with(
+    backend: &dyn crate::bluetooth::BluetoothBackend,
+    mac: &str,
+    budget: Duration,
+) -> Result<String, BtPortError> {
     let address = crate::bluetooth::Mac::parse(mac).ok_or_else(|| {
         BtPortError::NotReady("MAC 地址无法解析，请重新扫描设备列表".into())
     })?;
-    let backend = crate::bluetooth::backend();
     // Once, outside the loop: repeating it cannot help and each call may
-    // trigger a system-level renegotiation.
-    backend.ensure_spp(address).map_err(BtPortError::Failed)?;
-    poll_for_port(|| backend.spp_ports(), address, budget)
+    // trigger a system-level renegotiation. A failure is kept rather than
+    // returned, because it only matters if no port turns up either.
+    let enabled = backend.ensure_spp(address);
+    let polled = poll_for_port(|| backend.spp_ports(), address, budget);
+    match (enabled, polled) {
+        (_, Ok(port)) => Ok(port),
+        // No port appeared, so the enable request is the likelier explanation
+        // and its message is the more specific one.
+        (Err(message), Err(_)) => Err(BtPortError::Failed(message)),
+        (Ok(()), Err(not_ready)) => Err(not_ready),
+    }
 }
 
 /// Re-asks `list` for the SPP port bound to `address` until `budget` runs out.
@@ -6476,6 +6499,69 @@ mod tests {
                 assert!(reason.contains("还没有为该设备建立串口"), "{reason}")
             }
             BtPortError::Failed(message) => panic!("expected a retryable reason, got {message}"),
+        }
+    }
+
+    /// Stands in for the Windows backend so the enable/port interaction can be
+    /// exercised without hardware.
+    struct FakeBackend {
+        enable: fn() -> Result<(), String>,
+        ports: Vec<crate::bluetooth::SppPort>,
+    }
+
+    impl crate::bluetooth::BluetoothBackend for FakeBackend {
+        fn scan(&self, _seconds: u8) -> Result<Vec<crate::bluetooth::BtDevice>, String> {
+            Ok(Vec::new())
+        }
+        fn spp_ports(&self) -> Result<Vec<crate::bluetooth::SppPort>, String> {
+            Ok(self.ports.clone())
+        }
+        fn ensure_spp(&self, _mac: crate::bluetooth::Mac) -> Result<(), String> {
+            (self.enable)()
+        }
+        fn forget(&self, _mac: crate::bluetooth::Mac) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A machine that has been paired before already has its SPP service
+    /// enabled, and `BluetoothSetServiceState(ENABLE)` answers
+    /// `ERROR_INVALID_PARAMETER` (87) in that state. The port is there, so the
+    /// click must succeed instead of reporting "蓝牙操作失败（错误码 87）".
+    #[test]
+    fn an_already_enabled_spp_service_is_not_a_failure() {
+        let backend = FakeBackend {
+            enable: || Err(crate::bluetooth::describe_error(87)),
+            ports: vec![spp_port("COM7")],
+        };
+        let name = wait_for_spp_port_with(
+            &backend,
+            "70:4B:CA:72:AC:A2",
+            Duration::from_millis(150),
+        )
+        .unwrap();
+        assert_eq!(name, "COM7");
+    }
+
+    /// The tolerance must not swallow a real failure: when the enable request
+    /// fails *and* no port appears, its message is the one the user gets.
+    #[test]
+    fn a_failed_enable_with_no_port_still_reports_the_system_error() {
+        let backend = FakeBackend {
+            enable: || Err(crate::bluetooth::describe_error(87)),
+            ports: Vec::new(),
+        };
+        let err = wait_for_spp_port_with(
+            &backend,
+            "70:4B:CA:72:AC:A2",
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        match err {
+            BtPortError::Failed(message) => assert!(message.contains("87"), "{message}"),
+            BtPortError::NotReady(reason) => {
+                panic!("expected the enable error, got a retryable reason: {reason}")
+            }
         }
     }
 

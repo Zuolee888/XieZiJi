@@ -93,6 +93,7 @@ pub struct RegistryInstance {
 }
 
 /// An SPP COM port together with the peer address it is bound to.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SppPort {
     pub port_name: String,
     pub mac: Mac,
