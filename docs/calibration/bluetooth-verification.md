@@ -25,6 +25,7 @@
 | --- | --- | --- | --- |
 | 2026-11-19 | `cargo test --bins` | **通过** | `211 passed; 0 failed; 10 ignored; finished in 3.03s` |
 | 2026-11-19 | `node --test desktop/ui/src/*.test.mjs` | **通过** | 15 个文件 / `tests 75` / `pass 75` / `fail 0` |
+| 2026-11-20 | `cargo test --bins`（修 rc=87 后） | **通过** | `213 passed` / `0 failed` / `10 ignored` |
 | 2026-11-19 | `node ./node_modules/typescript/bin/tsc -b` | **通过** | exit 0，无输出 |
 
 10 个 ignored 全部是需要外部素材的既有用例（手写样本、真实项目文件等），与蓝牙无关；177→211 的增量即本次蓝牙功能的测试。
@@ -75,7 +76,23 @@ ok
 
 `describe_open_error` 按「端口是否仍在 `available_ports()` 列表里」区分占用与消失，不依赖 OS 文本（文本是本地化的）。这项行为有单元测试覆盖（`open_failures_explain_themselves_in_chinese` 的三态断言），**但没有跨进程实测**，见 §2 第 12 条。
 
-### 1.5 启动静默重连的两条路径
+### 1.5 已启用的 SPP 服务不是失败（2026-11-20 真机发现）
+
+`BluetoothSetServiceState(ENABLE)` 在服务**已经启用**时返回 `ERROR_INVALID_PARAMETER`（87）。实测三态：
+
+| 服务状态 | 返回 |
+| --- | --- |
+| 未启用（`spoff` 之后） | `rc=0` |
+| 已启用（刚启用过） | `rc=87` |
+| 已启用（早已启用） | `rc=87` |
+
+`:84` 曾把这个返回值直接当失败，于是「扫描 → 点连接」在一台**已配对**的机器上必然报「蓝牙操作失败（错误码 87）」，而「自动识别连接」因为不经过 `ensure_spp` 反而成功。这个差异只有真机走查能撞到：当时 `cargo test --bins` 211 全绿，`rc=87` 一次都没被触发。
+
+现行修法：`ensure_spp` 的错误被保留而不是立即返回，端口出现即成功；只有「enable 失败**且**端口没出现」才把系统错误报给用户。两条测试钉住这个分界（`an_already_enabled_spp_service_is_not_a_failure`、`a_failed_enable_with_no_port_still_reports_the_system_error`），变异验证：回退该修复 → 前者失败（212 passed / 1 failed）。
+
+顺带补掉了 §3 第 2 条里 M6 变异（整个跳过 `ensure_spp`）无法被杀死的缺口 —— `wait_for_spp_port` 抽出 `wait_for_spp_port_with`，后端可注入。
+
+### 1.6 启动静默重连的两条路径
 
 启动时记住的 MAC 有两条路：端口仍在列表里就直接 `connect`，端口不在（机器关机时 Windows 会丢掉 SPP 行）就退回 `bt_connect` 让后端先重建服务。**这个决策已被纯函数 `launchReconnect` 钉住**（`desktop/ui/src/btPanelModel.test.mjs`，含「没有记住 MAC → 不尝试」「端口在 → 用端口」「端口不在 → 用 MAC」「别的机器/同名 USB 口不得顶替」五组）。变异验证：把 `{ mac: rememberedMac }` 退回改成 `null` → 74 passed / 1 failed，抓到了。
 
@@ -92,7 +109,7 @@ npm run dev
 
 | # | 剧本 | 状态 | 观察记录 |
 | --- | --- | --- | --- |
-| 1 | 扫描 → 列表出现 `BtWriter（未配对）` → 点「连接」→ 自动建 SPP 口 → 握手成功。**若本机从未与该机器配对过，预期先失败并提示去 Windows 设置配对**（见 §3 第 13 条），配对后重试成功 | 待人工执行 | |
+| 1 | 扫描 → 列表出现 `BtWriter（已记忆，未认证）` → 点「连接」→ 自动建 SPP 口 → 握手成功。**若本机从未与该机器配对过，预期先失败并提示去 Windows 设置配对**（见 §3 第 13 条），配对后重试成功 | **2026-11-20 通过**（走查中发现并修掉了 rc=87 缺陷，见 §1.5） | 端口下拉列出 COM7 蓝牙串口与 COM13 CH340；扫描出 `BtWriter（已记忆，未认证）`；修复后点「连接」直接成功 |
 | 2 | 关闭 GUI 再打开 → 自动静默重连上次的 MAC；机器没开机时状态栏显示「蓝牙未连接」且不弹窗 | 待人工执行 | |
 | 3 | 连接中拔电源再上电 → 5 次退避内恢复，不重复下发运动指令 | 待人工执行 | |
 | 4 | 设备列表里不出现幽灵口与耳机口 | 待人工执行 | |
@@ -124,9 +141,9 @@ npm run dev
    | M3：`log_idle_bluetooth_link` 加 `if false &&` 前置 | `desktop/src/device.rs` `log_idle_bluetooth_link` | **没抓到**：211 passed / 0 failed |
    | M4：`still_listed` 恒置 `None` | `desktop/src/device.rs:802-810` | **没抓到**：211 passed / 0 failed |
    | M5：把 `failed_identity` 的读取移到 `connected_link = None` 之后 | `desktop/src/device.rs` 断链块 | **没抓到**：211 passed / 0 failed |
-   | M6：`wait_for_spp_port` 里跳过 `ensure_spp` | `desktop/src/device.rs` `wait_for_spp_port` | **没抓到**：211 passed / 0 failed |
+   | M6：`wait_for_spp_port` 里跳过 `ensure_spp` | `desktop/src/device.rs` `wait_for_spp_port` | **已能抓到**（2026-11-20 抽出 `wait_for_spp_port_with` 后可注入后端，见 §1.5；此前是没抓到） |
 
-   没抓到的六条原因相同：正确性活在 `worker_loop` 的接线里，而该循环没有注入点 —— `open_link` 直接调 `serialport::available_ports()`、`handshake` 直接读串口、`BluetoothRecovery` 的三路 `match` 又直接 `emit`。**把它们整体删掉，测试套件依然全绿**：observation → `LinkWarning` / idle 日志这条链路、端口下拉的重绑路径、蓝牙退避的触发点，都没有自动化测试兜底。要补需要给 `worker_loop` 加可注入的 backend 抽象，属于结构调整而非补测试，本期未做。**因此 §2 第 3、9、10、12、13、14 条人工走查不能跳过。**
+   没抓到的五条原因相同：正确性活在 `worker_loop` 的接线里，而该循环没有注入点 —— `open_link` 直接调 `serialport::available_ports()`、`handshake` 直接读串口、`BluetoothRecovery` 的三路 `match` 又直接 `emit`。**把它们整体删掉，测试套件依然全绿**：observation → `LinkWarning` / idle 日志这条链路、端口下拉的重绑路径、蓝牙退避的触发点，都没有自动化测试兜底。要补需要给 `worker_loop` 加可注入的 backend 抽象，属于结构调整而非补测试，本期未做。**因此 §2 第 3、9、10、12、13、14 条人工走查不能跳过。**
 
    UI 侧相反：`btPanelModel.test.mjs` 的 5 组变异抓到 4 组（去掉 `p.kind === "bluetooth"`、交换 `authenticated`/`remembered`、去掉 CH340 标记、删掉 `portLabel` 的蓝牙分支都会失败），只有删掉 `if (!rememberedMac) return null;` 守卫能存活，无害。但**没有任何 UI 测试 import `App.tsx`**，所以本次在投票环里做的状态修补（`pendingBtMac` 清理、`connectedVia` 推导、`pendingUsbSwitch`、启动重连）都不在测试覆盖内 —— 其中启动重连的**决策**已被 `launchReconnect` 的单测钉住，接线仍未。
 3. **「停止」只保证退避等待可中断**：若 `Stop` 正好落进某一次 `reconnect_bluetooth_once` 内部，仍需等完那一次（约 12 s），200 ms 上界不覆盖该情形。
