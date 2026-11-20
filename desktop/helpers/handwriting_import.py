@@ -95,7 +95,7 @@ def crop_data(image, bounds, options):
 
 
 def trace_raster(image, options):
-    f, e, line, d = (0, .5, .5, 0) if options.get('conservative') else (
+    f, e, line, d = (1, .5, .5, 0) if options.get('conservative') else (
         options['filter_iterations'], options['error_threshold'], options['line_threshold'], options['despeckle_level'])
     with tempfile.TemporaryDirectory(prefix='openink-glyph-') as temp:
         output = Path(temp) / 'trace.svg'

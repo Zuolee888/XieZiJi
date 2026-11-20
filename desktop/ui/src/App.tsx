@@ -764,7 +764,7 @@ export default function App() {
       ...o,
       threshold: value.startsWith("128") ? 128 : 180,
       conservative,
-      filter_iterations: conservative ? 0 : 4,
+      filter_iterations: conservative ? 1 : 4,
       error_threshold: conservative ? 0.5 : 2,
       line_threshold: conservative ? 0.5 : 1,
       despeckle_level: 0,
@@ -2920,7 +2920,7 @@ export default function App() {
                               conservative: v,
                               ...(v
                                 ? {
-                                    filter_iterations: 0,
+                                    filter_iterations: 1,
                                     error_threshold: 0.5,
                                     line_threshold: 0.5,
                                   }
@@ -2938,7 +2938,7 @@ export default function App() {
                           <p className="field-note">
                             当前生效：预平滑{" "}
                             {options.conservative
-                              ? 0
+                              ? 1
                               : options.filter_iterations}{" "}
                             次；曲线误差{" "}
                             {options.conservative
@@ -4100,7 +4100,7 @@ export default function App() {
                       <p>
                         128 默认和 180 默认均采用预平滑 4 次、曲线拟合 2
                         px、直线判定 1 px。180
-                        保守采用无预平滑、曲线与直线误差均为 0.5
+                        保守采用预平滑 1 次、曲线与直线误差均为 0.5
                         px。阈值增大可能保留浅墨，也可能引入噪声；更平滑不代表没有漏笔。拟合误差以
                         px 计，路径展平误差以 mm 计。2026-10-25
                         实写中用户评价阈值 180

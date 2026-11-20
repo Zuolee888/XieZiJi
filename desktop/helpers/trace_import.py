@@ -91,7 +91,7 @@ def main():
     image = image.convert('L').point(lambda v: 0 if v < a.threshold else 255).convert('RGB')
     ppm = Path(a.output).with_suffix('.ppm')
     if a.conservative:
-        a.filter_iterations, a.error_threshold, a.line_threshold, a.despeckle_level = 0, 0.5, 0.5, 0
+        a.filter_iterations, a.error_threshold, a.line_threshold, a.despeckle_level = 1, 0.5, 0.5, 0
     cmd = [a.autotrace, '-centerline', '-background-color', 'FFFFFF',
            '-despeckle-level', str(a.despeckle_level),
            '-filter-iterations', str(a.filter_iterations),

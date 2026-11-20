@@ -25,7 +25,7 @@ impl Default for ImportOptions {
     fn default() -> Self {
         Self {
             page: 1,
-            dpi: 300.,
+            dpi: 450.,
             threshold: 180,
             conservative: false,
             autotrace_path: default_autotrace(),
@@ -318,7 +318,7 @@ pub fn import_file(path: &Path, options: &ImportOptions) -> Result<Document, Str
             .arg("--threshold")
             .arg(options.threshold.to_string());
         let (filter, error, line, despeckle) = if options.conservative {
-            (0, 0.5, 0.5, 0)
+            (1, 0.5, 0.5, 0)
         } else {
             (
                 options.filter_iterations,
@@ -750,12 +750,12 @@ pub fn preview_variants(
     t180.threshold = 180;
     let mut conservative = t180.clone();
     conservative.conservative = true;
-    conservative.filter_iterations = 0;
+    conservative.filter_iterations = 1;
     conservative.error_threshold = 0.5;
     conservative.line_threshold = 0.5;
     let mut current = options.clone();
     if current.conservative {
-        current.filter_iterations = 0;
+        current.filter_iterations = 1;
         current.error_threshold = 0.5;
         current.line_threshold = 0.5;
         current.despeckle_level = 0;
