@@ -1,7 +1,7 @@
 {
   "name": "openink-studio-desktop",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "license": "GPL-3.0-only",
   "scripts": {
     "version:sync": "node scripts/sync-version.mjs",
@@ -11,5 +11,7 @@
     "prebuild": "npm run version:sync",
     "build": "tauri build"
   },
-  "devDependencies": {"@tauri-apps/cli": "^2.0.0"}
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
 }
