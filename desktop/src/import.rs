@@ -39,7 +39,11 @@ impl Default for ImportOptions {
     }
 }
 
-fn runtime_roots() -> Vec<PathBuf> {
+/// Directories searched for anything shipped alongside the executable:
+/// `OPENINK_RESOURCE_DIR`, the executable's own folder, its `resources/`
+/// subfolder (where the installer puts bundled files), and the source tree
+/// during development.
+pub(crate) fn runtime_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(dir) = std::env::var_os("OPENINK_RESOURCE_DIR") {
         roots.push(dir.into());
@@ -55,13 +59,39 @@ fn runtime_roots() -> Vec<PathBuf> {
 }
 pub(crate) fn helper(name: &str) -> Result<PathBuf, String> {
     runtime_roots().into_iter().map(|root|root.join("helpers").join(name)).find(|p|p.is_file())
-        .ok_or_else(||format!("Missing bundled helper {name}; place helpers next to the executable or set OPENINK_RESOURCE_DIR"))
+        .ok_or_else(||format!("缺少随程序分发的脚本 helpers/{name}。请把 helpers 文件夹放在程序所在目录，或用 OPENINK_RESOURCE_DIR 指向它。"))
 }
+/// Absolute path of `root`/`relative`, for the first root where it exists.
+///
+/// Shared with the starter-project lookup so both features agree on what
+/// "shipped with the program" means.
+pub(crate) fn shipped_file(relative: &str) -> Option<PathBuf> {
+    runtime_roots()
+        .into_iter()
+        .map(|root| root.join(relative))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Absolute path of `name` on PATH, if it names a real file.
+///
+/// The README tells people to put `autotrace.exe` on PATH, but a bare
+/// `PathBuf::from("autotrace.exe")` is not an absolute path and `is_file()`
+/// resolves it against the process working directory — which is not PATH. So an
+/// install that follows the README used to fail with "not found" anyway.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 fn default_autotrace() -> PathBuf {
     let mut candidates = Vec::new();
     for root in runtime_roots() {
         candidates.push(root.join("autotrace.exe"));
         candidates.push(root.join("autotrace/autotrace.exe"));
+        // Installers that ship the dependency bundle put it inside resources/.
+        candidates.push(root.join("autotrace/bin/autotrace.exe"));
     }
     candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cache/autotrace/bin-2020/autotrace.exe"),
@@ -69,19 +99,40 @@ fn default_autotrace() -> PathBuf {
     candidates
         .into_iter()
         .find(|p| p.is_file())
+        .or_else(|| find_on_path("autotrace.exe"))
         .unwrap_or_else(|| PathBuf::from("autotrace.exe"))
+}
+
+/// Resolve a configured executable: a real file is used as-is, and a bare name
+/// such as `autotrace.exe` is looked up on PATH before giving up.
+fn resolve_executable(configured: &Path) -> Option<PathBuf> {
+    if configured.is_file() {
+        return Some(configured.to_owned());
+    }
+    if configured.components().count() == 1 {
+        if let Some(name) = configured.to_str() {
+            return find_on_path(name);
+        }
+    }
+    None
 }
 pub(crate) fn default_python() -> PathBuf {
     for root in runtime_roots() {
         for relative in [
             "python/python.exe",
             "python.exe",
+            "python/bin/python.exe",
             "../.cache/desktop-python/Scripts/python.exe",
         ] {
             let candidate = root.join(relative);
             if candidate.is_file() {
                 return candidate;
             }
+        }
+    }
+    for name in ["python.exe", "python3.exe", "python"] {
+        if let Some(found) = find_on_path(name) {
+            return found;
         }
     }
     PathBuf::from("python")
@@ -124,13 +175,13 @@ fn verify_python(python: &Path, script: &Path, pdf: bool) -> Result<(), String> 
         .output()
         .map_err(|e| {
             format!(
-                "Cannot launch configured Python {} for helper {}: {e}",
+                "无法启动转换用的 Python（{}）来运行 {}：{e}。请在「设备控制 › 转换工具」里指定 python.exe 的完整路径。",
                 python.display(),
                 script.display()
             )
         })?;
     if !run.status.success() {
-        return Err(format!("Python dependencies unavailable. Configured Python: {}\nHelper: {}\n{}\nInstall with that interpreter: -m pip install Pillow PyMuPDF; or set OPENINK_PYTHON_MODULES to the installed module directory.",python.display(),script.display(),String::from_utf8_lossy(&run.stderr)));
+        return Err(format!("转换用的 Python 缺少依赖。当前 Python：{}\n脚本：{}\n{}\n请用这个 Python 安装：-m pip install Pillow PyMuPDF；或把已装好的模块目录设为 OPENINK_PYTHON_MODULES。",python.display(),script.display(),String::from_utf8_lossy(&run.stderr)));
     }
     Ok(())
 }
@@ -201,10 +252,15 @@ with fitz.open(sys.argv[1]) as pdf:
         .arg(path)
         .arg(page.to_string())
         .output()
-        .map_err(|e| format!("Cannot launch Python {}: {e}", python.display()))?;
+        .map_err(|e| {
+            format!(
+                "无法启动 PDF 背景渲染用的 Python（{}）：{e}。请在「设备控制 › 转换工具」里指定 python.exe 的完整路径。",
+                python.display()
+            )
+        })?;
     if !output.status.success() {
         return Err(format!(
-            "Cannot render PDF background (PyMuPDF required): {}",
+            "PDF 背景渲染失败，需要 PyMuPDF。报告：{}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -228,10 +284,10 @@ with fitz.open(sys.argv[1]) as doc:
 
 pub fn pdf_page_count_with_python(path: &Path, python: &Path) -> Result<usize, String> {
     let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cache/pdf-review");
-    let output=python_command(python).args(["-c","import sys; sys.path.append(sys.argv[2]); import fitz; d=fitz.open(sys.argv[1]); print(len(d))"]).arg(path).arg(cache).output().map_err(|e|format!("Cannot launch Python {}: {e}",python.display()))?;
+    let output=python_command(python).args(["-c","import sys; sys.path.append(sys.argv[2]); import fitz; d=fitz.open(sys.argv[1]); print(len(d))"]).arg(path).arg(cache).output().map_err(|e|format!("无法启动读取 PDF 页数的 Python（{}）：{e}。请在「设备控制 › 转换工具」里指定 python.exe 的完整路径。",python.display()))?;
     if !output.status.success() {
         return Err(format!(
-            "PDF inspection needs PyMuPDF (python -m pip install PyMuPDF): {}",
+            "读取 PDF 页数失败，需要 PyMuPDF：{}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -283,12 +339,13 @@ pub fn import_file(path: &Path, options: &ImportOptions) -> Result<Document, Str
         return read_svg(path, options.tolerance_mm, 25.4 / 96.);
     }
     validate_raster_options(options)?;
-    if !options.autotrace_path.is_file() {
-        return Err(format!(
-            "AutoTrace executable not found: {}. Configure an AutoTrace installation.",
+    let autotrace = resolve_executable(&options.autotrace_path).ok_or_else(|| {
+        format!(
+            "找不到 AutoTrace（{}）。请把 autotrace.exe 与它的 DLL 放到程序目录下的 autotrace 文件夹，\
+             或在「设备控制 › 转换工具」里指定 autotrace.exe 的完整路径。",
             options.autotrace_path.display()
-        ));
-    }
+        )
+    })?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -310,7 +367,7 @@ pub fn import_file(path: &Path, options: &ImportOptions) -> Result<Document, Str
             .arg(path)
             .arg(&output)
             .arg("--autotrace")
-            .arg(&options.autotrace_path)
+            .arg(&autotrace)
             .arg("--page")
             .arg(options.page.to_string())
             .arg("--dpi")
@@ -340,13 +397,13 @@ pub fn import_file(path: &Path, options: &ImportOptions) -> Result<Document, Str
         }
         let run = cmd.output().map_err(|e| {
             format!(
-                "Cannot launch Python {}: {e}",
+                "无法启动转换用的 Python（{}）：{e}。请在「设备控制 › 转换工具」里指定 python.exe 的完整路径。",
                 options.python_path.display()
             )
         })?;
         if !run.status.success() {
             return Err(format!(
-                "Raster/AutoTrace import failed. Python: {} Helper: {}\n{}",
+                "位图转中心线失败。Python：{} 脚本：{}\n{}",
                 options.python_path.display(),
                 script.display(),
                 String::from_utf8_lossy(&run.stderr)
@@ -788,6 +845,57 @@ pub fn preview_variants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_executable_name_is_resolved_through_path() {
+        // The README tells people to put autotrace.exe on PATH; a bare name must
+        // therefore be searched there instead of being tested as a relative file.
+        let dir = std::env::temp_dir().join(format!("openink-path-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("autotrace-fake-for-test.exe");
+        fs::write(&fake, b"stub").unwrap();
+        let joined = std::env::join_paths([dir.as_path()]).unwrap();
+        let previous = std::env::var_os("PATH");
+        std::env::set_var("PATH", &joined);
+        let resolved = resolve_executable(Path::new("autotrace-fake-for-test.exe"));
+        match previous {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(resolved, Some(fake));
+    }
+
+    #[test]
+    fn a_configured_absolute_path_that_is_missing_stays_unresolved() {
+        // A wrong absolute path must not silently fall back to some other copy on
+        // PATH: the user configured that file on purpose.
+        let missing = std::env::temp_dir().join(format!(
+            "openink-absent-{}/autotrace.exe",
+            std::process::id()
+        ));
+        assert_eq!(resolve_executable(&missing), None);
+    }
+
+    #[test]
+    fn a_present_executable_resolves_to_itself() {
+        let file = std::env::temp_dir().join(format!("openink-self-{}.exe", std::process::id()));
+        fs::write(&file, b"stub").unwrap();
+        let resolved = resolve_executable(&file);
+        let _ = fs::remove_file(&file);
+        assert_eq!(resolved, Some(file));
+    }
+
+    #[test]
+    fn missing_autotrace_explains_itself_in_chinese() {
+        let mut options = ImportOptions::default();
+        options.autotrace_path =
+            std::env::temp_dir().join(format!("openink-nope-{}/autotrace.exe", std::process::id()));
+        let error = import_file(Path::new("missing.png"), &options).unwrap_err();
+        assert!(error.contains("找不到 AutoTrace"), "{error}");
+        assert!(error.contains("转换工具"), "the message must say where to fix it: {error}");
+    }
+
     #[test]
     fn pdf_background_rejects_zero_before_launching_python() {
         assert!(pdf_background_page(Path::new("missing.pdf"), 0)
