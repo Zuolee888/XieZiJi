@@ -162,6 +162,15 @@ pub(crate) fn python_command(python: &Path) -> Command {
     if let Ok(joined) = std::env::join_paths(paths) {
         command.env("PYTHONPATH", joined);
     }
+    // 管道不是终端，Python 会按系统代码页（简中 Windows 是 cp936）写 stderr，
+    // 而这边一律用 from_utf8_lossy 解码 —— 中文提示会变成一串问号。
+    // 强制子进程用 UTF-8，报错才能原样到达用户眼前。
+    command.env("PYTHONIOENCODING", "utf-8");
+    command.env("PYTHONUTF8", "1");
+    // PyMuPDF 每次 import fitz 都往 stderr 打一条 FutureWarning；这些 stderr 会
+    // 原样成为用户看到的导入失败说明，一条无关的弃用警告排在最前面会挡住真正的
+    // 原因。全局只是「不显示」，不改变任何行为。
+    command.env("PYTHONWARNINGS", "ignore::DeprecationWarning,ignore::FutureWarning");
     command
 }
 fn verify_python(python: &Path, script: &Path, pdf: bool) -> Result<(), String> {
@@ -241,9 +250,14 @@ with fitz.open(sys.argv[1]) as pdf:
     if not 1 <= number <= len(pdf):
         raise ValueError(f'PDF page must be 1..{len(pdf)}')
     page = pdf[number - 1]
-    if page.rect.width * page.rect.height * (110 / 72) ** 2 > 50_000_000:
-        raise ValueError('PDF background exceeds 50 million pixels')
-    pix = page.get_pixmap(dpi=110, colorspace=fitz.csRGB, alpha=False)
+    # 背景只是给人看的纸面参考。超大画幅在 110 dpi 下会撞到 5000 万像素上限，
+    # 与其拒绝渲染，不如按上限反推一个还够用的 dpi —— 纸越大，背景越糊，
+    # 但页面照样能打开。
+    dpi = 110
+    pixels = page.rect.width * page.rect.height * (dpi / 72) ** 2
+    if pixels > 50_000_000:
+        dpi = int((50_000_000 / (page.rect.width * page.rect.height)) ** 0.5 * 72)
+    pix = page.get_pixmap(dpi=max(dpi, 1), colorspace=fitz.csRGB, alpha=False)
     print(json.dumps(dict(data_url='data:image/png;base64,' + base64.b64encode(pix.tobytes('png')).decode('ascii'), width_mm=page.rect.width * 25.4 / 72, height_mm=page.rect.height * 25.4 / 72, page_count=len(pdf))))
 "#;
     let python = default_python();
@@ -409,7 +423,12 @@ pub fn import_file(path: &Path, options: &ImportOptions) -> Result<Document, Str
                 String::from_utf8_lossy(&run.stderr)
             ));
         }
-        let mut doc = read_svg(&output, options.tolerance_mm, 25.4 / options.dpi)?;
+        // 超大画幅时脚本会自行把取样密度压到 5000 万像素以内，并把它实际用的
+        // dpi 打在 stdout 上。像素→毫米必须按这个值换算，否则整页会按请求值
+        // 缩放（450 请求压到 408 时差 9%）。读不到就退回请求值。
+        let effective_dpi = parse_effective_dpi(&String::from_utf8_lossy(&run.stdout))
+            .unwrap_or(options.dpi);
+        let mut doc = read_svg(&output, options.tolerance_mm, 25.4 / effective_dpi)?;
         doc.name = path
             .file_name()
             .unwrap_or_default()
@@ -419,6 +438,18 @@ pub fn import_file(path: &Path, options: &ImportOptions) -> Result<Document, Str
     })();
     let _ = fs::remove_dir_all(dir);
     result
+}
+
+/// Read the sampling density the helper actually used. The raster helper lowers
+/// its own dpi when a page would exceed the pixel cap and reports the value it
+/// settled on; without that number the caller would scale the page by the
+/// requested dpi and every stroke would land 9% off.
+fn parse_effective_dpi(stdout: &str) -> Option<f64> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("EFFECTIVE_DPI "))
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.)
 }
 
 fn read_svg(path: &Path, tolerance: f64, pixel_mm: f64) -> Result<Document, String> {
@@ -744,17 +775,25 @@ pub(crate) fn font_centerline(
             .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err(format!(
-                "Font rasterization failed (Pillow required): {}",
+                "文字渲染失败（需要 Pillow）：{}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
+        let metrics: serde_json::Value = serde_json::from_slice(&fs::read(image.with_extension("json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        // 超大版面时脚本会把取样密度压到 5000 万像素以内，并把实际值写在 dpi 字段。
+        // 像素→毫米必须按这个值算，否则字号会按请求值放大。老版本脚本没有这个字段，
+        // 读不到就按请求值处理。
+        let render_dpi = metrics["dpi"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v > 0.)
+            .unwrap_or(options.dpi);
         let mut local = options.clone();
         local.page = 1;
+        local.dpi = render_dpi;
         let mut doc = import_file(&image, &local)?;
         if baseline {
-            let metrics: serde_json::Value = serde_json::from_slice(&fs::read(image.with_extension("json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let pixel_mm = 25.4 / render_dpi;
             let metric = |name: &str| metrics[name].as_f64().filter(|v| v.is_finite()).ok_or_else(|| format!("Missing font metric {name}"));
-            let pixel_mm = 25.4 / options.dpi;
             let origin_x = metric("origin_x")? * pixel_mm;
             let origin_y = metric("baseline_y")? * pixel_mm;
             for p in doc.strokes.iter_mut().flatten() { p.x -= origin_x; p.y -= origin_y; }
@@ -845,6 +884,27 @@ pub fn preview_variants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lowered_sampling_density_is_read_back_from_the_helper() {
+        // 脚本在超出像素上限时自己降 dpi，把实际值打在 stdout。读错了整页缩放就错。
+        assert_eq!(parse_effective_dpi("EFFECTIVE_DPI 408\n"), Some(408.));
+        assert_eq!(
+            parse_effective_dpi("some noise\nEFFECTIVE_DPI 296.5\r\nmore noise\n"),
+            Some(296.5)
+        );
+    }
+
+    #[test]
+    fn a_missing_or_broken_sampling_density_falls_back_to_the_requested_value() {
+        // 老版本脚本没有这一行；宁可按请求值算，也不要拿 0 或 NaN 去除。
+        assert_eq!(parse_effective_dpi(""), None);
+        assert_eq!(parse_effective_dpi("EFFECTIVE_DPI \n"), None);
+        assert_eq!(parse_effective_dpi("EFFECTIVE_DPI abc\n"), None);
+        assert_eq!(parse_effective_dpi("EFFECTIVE_DPI 0\n"), None);
+        assert_eq!(parse_effective_dpi("EFFECTIVE_DPI -450\n"), None);
+        assert_eq!(parse_effective_dpi("EFFECTIVE_DPI inf\n"), None);
+    }
 
     #[test]
     fn a_bare_executable_name_is_resolved_through_path() {

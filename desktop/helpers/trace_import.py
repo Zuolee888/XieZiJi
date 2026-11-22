@@ -75,8 +75,21 @@ def main():
             if not 1 <= a.page <= len(pdf):
                 raise ValueError(f'PDF page must be 1..{len(pdf)}')
             page = pdf[a.page - 1]
+            # 页面尺寸以毫米算，栅格分辨率只影响取样密度。大画幅的板子（比如 381x508 mm
+            # 的实验报告纸）在 450 dpi 下就是六千万像素，超过上限。与其让用户自己回去改
+            # 分辨率，不如按上限反推一个还够用的 dpi 继续画 —— 纸越大，取样越疏，
+            # 但笔画的位置不变。实际用了多少 dpi 必须报回去（EFFECTIVE_DPI），
+            # 否则 Rust 侧仍按 450 换算像素→毫米，整页会缩小 9%。
             if page.rect.width * page.rect.height * (a.dpi / 72) ** 2 > 50_000_000:
-                raise ValueError('Page raster exceeds 50 million pixels; lower DPI')
+                a.dpi = int((50_000_000 / (page.rect.width * page.rect.height)) ** 0.5 * 72)
+                if a.dpi < 36:
+                    raise ValueError(
+                        '这一页的纸张尺寸是 {:.0f}x{:.0f} 毫米，即使降到 36 dpi 也需要超过 '
+                        '5000 万像素，无法转换。请拆分页面后再试。'.format(
+                            page.rect.width * 25.4 / 72,
+                            page.rect.height * 25.4 / 72,
+                        )
+                    )
             pix = page.get_pixmap(dpi=round(a.dpi), colorspace=fitz.csRGB, alpha=False)
             image = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
     else:
@@ -86,7 +99,16 @@ def main():
         white = Image.new('RGBA', image.size, 'white')
         image = Image.alpha_composite(white, image).convert('RGB')
     if image.width * image.height > 50_000_000:
-        raise ValueError('Image exceeds 50 million pixels')
+        # 位图的像素是既成事实，不能像 PDF 那样重采样降级（换密度等于改用户的图）。
+        # 只能让他自己缩图，所以要说清当前多大、要缩到多少。
+        scale = (50_000_000 / (image.width * image.height)) ** 0.5
+        raise ValueError(
+            '这张图的像素是 {}x{}，共 {:.0f} 万，超过 5000 万的上限。'
+            '把它缩到 {}x{} 或更小后再导入。'.format(
+                image.width, image.height, image.width * image.height / 10000,
+                int(image.width * scale), int(image.height * scale),
+            )
+        )
     # Threshold only: no enlargement, morphological cleanup or invented strokes.
     image = image.convert('L').point(lambda v: 0 if v < a.threshold else 255).convert('RGB')
     ppm = Path(a.output).with_suffix('.ppm')
@@ -98,11 +120,20 @@ def main():
            '-error-threshold', str(a.error_threshold), '-line-threshold', str(a.line_threshold)]
     cmd += ['-output-file', a.output, str(ppm)]
     trace_image(image, a.output, cmd)
+    # 实际取样密度可能与请求值不同（超大画幅被上限压低）。Rust 侧拿这个数换算
+    # 像素→毫米，读不到就退回请求值，所以必须打在 stdout 上。
+    print('EFFECTIVE_DPI', a.dpi)
 
 
 if __name__ == '__main__':
     try:
         main()
     except Exception as e:
-        print(f'{e}\nPython: {sys.executable}\nHelper: {Path(__file__).resolve()}\nModule search: {sys.path}', file=sys.stderr)
+        # 用户看到的应该是「怎么办」，不是模块搜索路径。只有真的缺依赖（ImportError /
+        # 找不到脚本）时，Python 路径与 sys.path 才有诊断价值；其余情况（dpi 超限、
+        # 参数非法）把这几行噪声收起来，免得挡住第一句可执行的提示。
+        if isinstance(e, (ImportError, RuntimeError)):
+            print(f'{e}\nPython: {sys.executable}\nHelper: {Path(__file__).resolve()}\nModule search: {sys.path}', file=sys.stderr)
+        else:
+            print(str(e), file=sys.stderr)
         sys.exit(1)
