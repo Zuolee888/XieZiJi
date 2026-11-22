@@ -1,0 +1,14 @@
+# .inkproj 是 zip 压缩包。全靠 Git 自己嗅探 NUL 字节来判断二进制并不保险：
+# 一个条目很少的工程包，压缩后可能刚好不含 NUL，就会被 core.autocrlf=true 当成
+# 文本改写换行，包随即损坏，而且是静默损坏——等到用户打开工程才报「不是有效的
+# .inkproj 工程包」。显式声明成二进制，把这个运气成分去掉。
+*.inkproj binary
+*.kjoy binary
+*.exe binary
+*.dll binary
+*.onnx binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.woff2 binary
