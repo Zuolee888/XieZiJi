@@ -132,6 +132,32 @@ impl TemplateProvider for TemplateStore {
                 lines: 24,
                 space_mm: None,
             },
+            // 与出厂样板（样板工程 starter-physics.inkproj）配套的版面：
+            // 换一台电脑、样板被用户另存之后，仍能在模板列表里找回同一套版心。
+            Template {
+                id: "builtin-physics".into(),
+                name: "自物理实验报告".into(),
+                description: "210 × 297 mm / 样板工程的版心（36 行 / 边距 20 mm）".into(),
+                width_mm: 210.,
+                height_mm: 297.,
+                margin_mm: 20.,
+                font_size_mm: 10.,
+                letter_spacing_mm: 1.,
+                lines: 36,
+                space_mm: None,
+            },
+            Template {
+                id: "builtin-grid".into(),
+                name: "自学院稿纸".into(),
+                description: "190 × 265 mm / 稿纸版心（21 行 / 边距 19 mm）".into(),
+                width_mm: 190.,
+                height_mm: 265.,
+                margin_mm: 19.,
+                font_size_mm: 10.,
+                letter_spacing_mm: 1.,
+                lines: 21,
+                space_mm: None,
+            },
         ];
         if self.directory.exists() {
             // One unreadable or corrupt file must not hide every other saved
@@ -182,5 +208,33 @@ mod tests {
         t.margin_mm = 1000.;
         assert!(TemplateStore::validate(&t).is_err());
         assert!(store.delete("../escape").is_err());
+    }
+    /// 样板工程的版心必须能在模板列表里找到，否则用户另存样板之后就再也
+    /// 还原不出同一套版面。
+    #[test]
+    fn the_shipped_templates_back_the_starter_project() {
+        let store = TemplateStore {
+            directory: std::env::temp_dir().join("unused-openink-test"),
+        };
+        let items = store.list().unwrap();
+        let physics = items.iter().find(|t| t.id == "builtin-physics").expect("builtin-physics");
+        assert_eq!((physics.width_mm, physics.height_mm, physics.margin_mm, physics.lines), (210., 297., 20., 36));
+        let grid = items.iter().find(|t| t.id == "builtin-grid").expect("builtin-grid");
+        assert_eq!((grid.width_mm, grid.height_mm, grid.margin_mm, grid.lines), (190., 265., 19., 21));
+    }
+    /// 内置模板不能靠名字去重：用户目录里恰有一份同名文件时，两者都要在，
+    /// 否则「另存为内置同名模板」会凭空消失。
+    #[test]
+    fn builtin_templates_survive_a_same_named_local_file() {
+        let directory = std::env::temp_dir().join("openink-template-samename-test");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("local.json"), r#"{"id":"physics-copy","name":"自物理实验报告","description":"","width_mm":210,"height_mm":297,"margin_mm":20,"font_size_mm":10,"letter_spacing_mm":1,"lines":36}"#).unwrap();
+        let store = TemplateStore { directory };
+        let items = store.list().unwrap();
+        assert!(items.iter().any(|t| t.id == "builtin-physics"));
+        assert!(items.iter().any(|t| t.id == "physics-copy"));
+        assert_eq!(items.iter().filter(|t| t.name == "自物理实验报告").count(), 2);
+        let _ = fs::remove_dir_all(store.directory);
     }
 }

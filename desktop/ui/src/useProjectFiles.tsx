@@ -18,7 +18,7 @@ export function useProjectFiles({ snapshot, path, onPath, blocked, closeBlocked 
   snapshot: Project; path: string; onPath: (path: string) => void; blocked: boolean; desktop: boolean;
   closeBlocked?: boolean; closeWarning?: string;
   onSave: (path: string, project: Project) => Promise<void>;
-  onOpen: (path: string) => Promise<void>; onNew: () => Promise<void>;
+  onOpen: (path: string, adopt?: boolean) => Promise<void>; onNew: () => Promise<void>;
   onMessage: (message: string, error?: boolean) => void;
 }) {
   const key = useMemo(() => JSON.stringify(snapshot), [snapshot]);
@@ -127,6 +127,16 @@ export function useProjectFiles({ snapshot, path, onPath, blocked, closeBlocked 
     await current.current.onOpen(value);
     onPath(value); setNativeProjectTitle(value); remember(value); settleClean();
   });
+  // The starter project belongs to the program, not to the user's documents:
+  // loading it must not make its bundled path the project's own file, or the
+  // first Ctrl+S would try to overwrite a file inside the install directory
+  // (and "save before quitting" would offer to write there). So it loads like
+  // a project but leaves the path empty and stays out of the recent list.
+  const openStarter = (selected: string) => run(async () => {
+    if (current.current.blocked) return;
+    await current.current.onOpen(selected, false);
+    onPath(""); setNativeProjectTitle(""); settleClean();
+  });
   const newProject = () => run(async () => {
     if (!await guard() || current.current.blocked) return;
     await current.current.onNew(); onPath(""); setNativeProjectTitle(""); settleClean();
@@ -176,5 +186,5 @@ export function useProjectFiles({ snapshot, path, onPath, blocked, closeBlocked 
     {closingPrompt && closeWarning && <p className="field-note" role="status">{closeWarning}</p>}
     <div className="project-confirm-actions"><button className="button" autoFocus onClick={() => answer("cancel")}>取消</button><button className="button" onClick={() => answer("discard")}>不保存</button><button className="button primary" onClick={() => answer("save")}>保存并继续</button></div>
   </div></div> : null;
-  return { dirty, pending, recent, saveProject, openProject, newProject, confirmation };
+  return { dirty, pending, recent, saveProject, openProject, openStarter, newProject, confirmation };
 }

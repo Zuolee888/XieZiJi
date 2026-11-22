@@ -1405,7 +1405,8 @@ export default function App() {
       }))
       .catch(() => {});
     call<RegistrationProfile[]>("list_registration_profiles").then(v => setRegistrationProfiles(current => [...v, ...current.filter(p => !v.some(q => q.id === p.id))])).catch(e => notify(String(e), true));
-    call<string | null>("startup_project_path").then(path => { if (path) void openProjectFile(path); }).catch(e => notify(String(e), true));
+    // 命令行带工程文件就开它；否则载入出厂样板，让每次启动都落在同一套版心上。
+    call<string | null>("startup_project_path").then(path => path ? openProjectFile(path) : openStarterProject()).catch(e => notify(String(e), true));
     command({ type: "scan" });
     const timer = setInterval(async () => {
       if (polling) return;
@@ -2368,6 +2369,10 @@ export default function App() {
     onOpen: restoreProject, onNew: resetProject, onMessage: notify });
   async function saveProject() { await files.saveProject(); }
   async function openProjectFile(path?: string) { await files.openProject(path); }
+  async function openStarterProject() {
+    const starter = await call<string | null>("starter_project_path");
+    if (starter) await files.openStarter(starter);
+  }
   async function resetProject() {
     const previous = JSON.stringify(preparedDocRef.current);
     if (!await command({ type: "forget_calibration" })) throw new Error("设备状态变更，请停稳后新建工程");
@@ -2391,7 +2396,7 @@ export default function App() {
     setActiveRoute(null); setRouteInspection(null); setRouteComparison(null); setRouteComparisonError("");
     notify("已新建空白工程");
   }
-  async function restoreProject(selected: string) {
+  async function restoreProject(selected: string, adopt = true) {
     const previous = JSON.stringify(preparedDocRef.current);
     setBusy("打开完整工程");
     try {
@@ -2403,8 +2408,16 @@ export default function App() {
       value.template = layoutTemplate(normalized.layouts.find(l => l.id === value.pages[value.current_page]?.layout_id)!);
       const background = value.pages[value.current_page].background;
       if (background?.path && !background.data_url) {
-        const rendered = background.kind === "image" ? await call<BackgroundPage>("paper_background", { path: background.path, page: 1, width_mm: value.template.width_mm, height_mm: value.template.height_mm, process: false, remove_shadow: false, corners: null, python_path: options.python_path }) : await call<BackgroundPage>("pdf_background_page", { path: background.path, page: background.page });
-        background.data_url = rendered.data_url;
+        try {
+          const rendered = background.kind === "image" ? await call<BackgroundPage>("paper_background", { path: background.path, page: 1, width_mm: value.template.width_mm, height_mm: value.template.height_mm, process: false, remove_shadow: false, corners: null, python_path: options.python_path }) : await call<BackgroundPage>("pdf_background_page", { path: background.path, page: background.page });
+          background.data_url = rendered.data_url;
+        } catch (e) {
+          // 样板必须能打开。渲染页面背景要 Python + PyMuPDF，缺了它排版与书写
+          // 依然可用，不该因此让程序连启动都失败；打开用户自己的工程则照旧报错，
+          // 免得用户以为背景丢了。
+          if (adopt) throw e;
+          notify(`样板工程的页面背景没能渲染出来（${String(e)}）；排版与书写不受影响。`, true);
+        }
       }
       if (editingBlocked()) throw new Error("设备状态变更，未替换当前工程");
       if (previous !== JSON.stringify(preparedDocRef.current)) throw new Error("工程内容在打开期间发生变化，未替换当前工程，请重试");
@@ -2435,14 +2448,14 @@ export default function App() {
       setMachineOriginReady(false);
       setRegistrationLocked(false); setRegistrationPointEdit(null);
       setRestoreSetup({ version: Date.now(), value: { points: calibration.points, show_points: calibration.show_points, selected_profile: candidate ? candidate.id : calibration.selected_profile } });
-      setProjectRevision(v => v + 1); setProjectPath(selected);
+      setProjectRevision(v => v + 1); if (adopt) setProjectPath(selected);
       setRotation(0); setScale(1); setSource(""); setPageCount(null);   setClipboardFiles([]);
       setWrittenIds(new Set(value.pages.flatMap(p => p.document.writtenStrokeIds || [])));
       setBatchReview(new Set(value.pages.flatMap((p, i) => (p.document.reviewBatchIds || []).map(id => `${i}:${id}`))));
       setSelectedBatch(batchesOf(next)[0].id); submittedBatch.current = null;
       setProgress({ sent: 0, total: 0 }); setJobTiming(emptyJobTiming); setActiveRoute(null); setRouteInspection(null); setRouteComparison(null); setRouteComparisonError("");
       setLeftOpen(true); setLeftTab("board");
-      notify(`已打开工程 ${fileName(selected)}；请用两点校准当前旋转，缩放比例沿用保存值`);
+      notify(adopt ? `已打开工程 ${fileName(selected)}；请用两点校准当前旋转，缩放比例沿用保存值` : "已载入出厂样板工程；用它书写需要另存为自己的工程，保存在程序目录里的样板不会被改动");
     } finally { setBusy(""); }
   }
   async function saveTemplate() {

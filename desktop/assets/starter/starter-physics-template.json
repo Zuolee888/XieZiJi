@@ -1,0 +1,11 @@
+{
+  "id": "builtin-physics",
+  "name": "自物理实验报告",
+  "description": "自由排版，从一张白纸开始",
+  "width_mm": 210.0,
+  "height_mm": 297.0,
+  "margin_mm": 20.0,
+  "font_size_mm": 10.0,
+  "letter_spacing_mm": 1.0,
+  "lines": 36
+}

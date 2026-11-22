@@ -1,0 +1,11 @@
+{
+  "id": "builtin-grid",
+  "name": "自学院稿纸",
+  "description": "自由排版，从一张白纸开始",
+  "width_mm": 190.0,
+  "height_mm": 265.0,
+  "margin_mm": 19.0,
+  "font_size_mm": 10.0,
+  "letter_spacing_mm": 1.0,
+  "lines": 21
+}

@@ -42,6 +42,7 @@ fn main() {
             project::save_project,
             project::open_project,
             project::startup_project_path,
+            project::starter_project_path,
             paper::paper_background,
             clipboard::clipboard_files,
             clipboard::clipboard_file_preview,

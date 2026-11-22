@@ -440,10 +440,55 @@ pub fn startup_project_path() -> Option<String> {
     std::env::args().skip(1).find(|p| Path::new(p).extension().is_some_and(|e| e.eq_ignore_ascii_case("inkproj") || e.eq_ignore_ascii_case("kjoy")))
 }
 
+/// Path of the bundled starter project, if this build shipped one.
+///
+/// The starter is a real `.inkproj` so it is read by the same `open_at` used
+/// for every other project: one reader, no second schema to keep in sync with
+/// the saver. It deliberately lives outside the user's document folder, so the
+/// front end loads it without adopting its path as the project's own file.
+#[tauri::command]
+pub fn starter_project_path() -> Option<String> {
+    crate::import::shipped_file("assets/starter/starter-physics.inkproj")
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    /// 打开工程会用它自带的 writing/conversion 覆盖本机设置，所以出厂样板必须
+    /// 就是当前要求的参数；否则每次启动都会把用户的进给与栅格分辨率改回旧值。
+    #[test]
+    fn the_starter_project_carries_the_current_defaults() {
+        let path = crate::import::shipped_file("assets/starter/starter-physics.inkproj")
+            .expect("starter project ships with the source tree");
+        let project = open_at(&path).expect("starter project opens");
+        assert_eq!(
+            (project.writing.feed, project.writing.travel_feed, project.writing.z_feed, project.writing.z_down, project.writing.jog_step),
+            (4500., 3500., 4500., 6., 1.)
+        );
+        assert_eq!(project.conversion.dpi, 450.);
+        assert_eq!(project.pages.len(), 4);
+        // 样板是空白的：只有背景与版心，不该带着别人的笔画。
+        assert!(project.pages.iter().all(|p| p.document["strokes"].as_array().is_some_and(|s| s.is_empty())));
+        assert_eq!(
+            (project.template.width_mm, project.template.height_mm, project.template.margin_mm),
+            (210., 297., 20.)
+        );
+    }
+    /// 稿纸样板随包分发，打开它会用工程自带的 conversion 覆盖本机设置，
+    /// 所以它的 dpi 必须是当前默认值，不能还是上游那套 300。
+    #[test]
+    fn the_grid_sample_carries_the_current_defaults() {
+        let path = crate::import::shipped_file("assets/samples/中原工学院稿纸模板工程.inkproj")
+            .expect("grid sample ships with the source tree");
+        let project = open_at(&path).expect("grid sample opens");
+        assert_eq!(project.conversion.dpi, 450.);
+        assert_eq!(
+            (project.writing.feed, project.writing.travel_feed, project.writing.z_feed, project.writing.z_down, project.writing.jog_step),
+            (4500., 3500., 4500., 6., 1.)
+        );
+    }
     #[test]
     fn batch_metadata_rejects_dangling_owners_and_completion() {
         let mut doc = json!({"strokeIds":["s1"], "batches":[{"id":"b1","name":"正文","color":1}], "strokeBatches":{"s1":"b1"}, "writtenStrokeIds":["s1"], "reviewBatchIds":["b1"]});
