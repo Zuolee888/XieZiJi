@@ -15,6 +15,12 @@ node_modules/
 desktop/ui/dist/
 desktop/gen/
 
+# 随安装包分发的运行时依赖：由 desktop/scripts/prepare-deps.mjs 从 .cache 与
+# %LOCALAPPDATA% 拷进来，约 590 MB，绝不进仓库。
+desktop/autotrace/
+desktop/python/
+desktop/ocr-models/
+
 # 工具运行生成的 gcode 输出（如 official_write.py 产物）
 out_*.gcode
 

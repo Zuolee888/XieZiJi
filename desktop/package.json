@@ -6,9 +6,10 @@
   "scripts": {
     "version:sync": "node scripts/sync-version.mjs",
     "version": "npm run version:sync",
+    "deps": "node scripts/prepare-deps.mjs",
     "predev": "npm run version:sync",
     "dev": "tauri dev",
-    "prebuild": "npm run version:sync",
+    "prebuild": "npm run version:sync && npm run deps",
     "build": "tauri build"
   },
   "devDependencies": {
